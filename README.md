@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/walk.svg" alt="ASCII girl walking toward the camera to Cry by Aisin-Gioro and Toyoki" width="360"></p>
+
 # hey, I'm rijul 👋
 
 CS grad student at RPI, working on the agents/evals/data side of AI. I make context-aware agents because I'm tired of being the only one with situational awareness.
