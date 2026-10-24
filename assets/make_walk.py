@@ -1,113 +1,254 @@
-"""Generates walk.svg: an ASCII back-view walk down a night road for the profile README. Run: python3 make_walk.py"""
-from html import escape
+"""Generates walk.gif: a shaded-ASCII loop of an original girl walking away down a night road.
+
+The scene is drawn as greyscale shapes, then each character cell picks a glyph by brightness
+and a colour by what it covers. Everything is periodic in the loop phase, so it loops cleanly.
+Run: uv run --with numpy --with pillow assets/make_walk.py
+"""
 from pathlib import Path
 
-COLS, ROWS, MID, HORIZON = 48, 23, 24, 2
-N, CYCLE = 8, 1.1  # frames per stride cycle, seconds per cycle
-SWAY = [0, 1, 2, 1, 0, -1, -2, -1]  # hair/hip sway, opposite to the stepping foot
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
-HEAD = [
-    ("    ._    _.    ", "bow"),
-    ("   ( >-()-< )   ", "bow"),
-    ("    '-'  '-'    ", "bow"),
-    ("    .-" + "'" * 4 + "-.    ", "hair"),
-    ("   " + "/" * 5 + "\\" * 5 + "   ", "hair"),
-    ("  " + "|" * 12 + "  ", "hair"),
-]
+COLS, ROWS, SS = 160, 60, 3  # character grid, supersamples per cell side
+STRIDE_FRAMES, STRIDES, FRAME_MS = 12, 2, 80  # 2 strides so the lamps (2 strides apart) loop too
+NF = STRIDE_FRAMES * STRIDES
+FONT = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 9)
+CW, LH = FONT.getlength("M"), 10
+W, H = COLS * CW, ROWS * LH
+RAMP = " .,:;ir7SXZ2a0B8MW@"  # letter-weighted: heavy glyphs only where the figure is dense
 
-def girl(f):
-    """Rows of (text, part) for frame f; 16 columns wide."""
-    s = SWAY[f]
-    left_step = f < N // 2
-    rows = list(HEAD)
-    for i in range(7):  # hair hangs past the waist; tips swing furthest
-        off = round(s * i / 4)
-        w = 10 - max(0, i - 4) * 2
-        cells = [" "] * 16
-        for j, ch in enumerate("(" + "|" * w + ")"):
-            cells[2 + (10 - w) // 2 + off + j] = ch
-        # arms in their own columns: the forward-swinging arm is shorter
-        if i < 3:
-            if i < (2 if left_step else 3):
-                cells[0] = "|"
-            if i < (3 if left_step else 2):
-                cells[15] = "|"
-        elif i == 3:
-            cells[15 if left_step else 0] = "'"
-        rows.append(("".join(cells), "hair"))
-    rows += [
-        ("  .~~~~~~~~~~.  ", "dress"),
-        (" (  ~  ~  ~  ~ )", "dress"),
-        (["(_,_,_,_,_,_,_,)", "(,_,_,_,_,_,_,_)"][f % 2], "dress"),
-        ("     |    |     ", "legs"),
-        ("     |    |     ", "legs"),
-        ("    [_]   u     " if left_step else "     u   [_]    ", "legs"),
-    ]
-    hip = (s > 0) - (s < 0)  # whole body rocks with the hips
-    return [(" " * (1 + hip) + t, p) for t, p in rows], ROWS - len(rows)
+SKY, STAR, TREE, GRASS, ROAD, DASH, POST, GLOW, HAIR, BOW, DRESS, LACE, SKIN, SOCK, SHOE = range(15)
+COLOURS = np.array([
+    (120, 110, 150), (255, 245, 215), (120, 140, 130), (140, 170, 150), (190, 185, 215), (250, 225, 150),
+    (170, 165, 195), (255, 225, 170), (185, 160, 245), (255, 130, 190), (255, 250, 252),
+    (255, 215, 232), (255, 205, 180), (255, 255, 255), (200, 170, 215),
+], float)
+GIRL_PARTS = [HAIR, BOW, DRESS, LACE, SKIN, SOCK, SHOE]
+
+# camera: horizon line, focal length (px), eye height (m); she walks 1.4 m per stride
+HOR, VPX, F, EYE, STEP_M = 230.0, W * 0.47, 626.0, 1.3, 1.4
+
+def hash2(a, b):
+    """Deterministic 0..1 noise per integer lattice cell."""
+    return (np.sin(a * 127.1 + b * 311.7) * 43758.5453) % 1.0
+
+def ellipse(X, Y, cx, cy, rx, ry, rot=0.0):
+    c, s = np.cos(rot), np.sin(rot)
+    dx, dy = X - cx, Y - cy
+    return ((dx * c + dy * s) / rx) ** 2 + ((-dx * s + dy * c) / ry) ** 2
+
+def capsule(X, Y, ax, ay, bx, by, r):
+    """Mask of points within r of segment a-b."""
+    px, py, vx, vy = X - ax, Y - ay, bx - ax, by - ay
+    h = np.clip((px * vx + py * vy) / (vx * vx + vy * vy), 0, 1)
+    return (px - vx * h) ** 2 + (py - vy * h) ** 2 < r * r
+
+def background(X, Y, t2, L, P):
+    """t2: phase over the whole loop (0..1, both strides)."""
+    travel = t2 * STEP_M * STRIDES
+    L[:] = 0.04 + 0.05 * np.clip((HOR - Y) / HOR, 0, 1)
+    P[:] = SKY
+    # stars that twinkle on integer loop frequencies
+    sx, sy = np.floor(X / 9), np.floor(Y / 10)
+    star = (hash2(sx, sy) > 0.985) & (Y < HOR - 40)
+    tw = 0.5 + 0.5 * np.sin(2 * np.pi * (t2 * np.floor(1 + 3 * hash2(sy, sx)) + hash2(sx + 7, sy)))
+    L[star] = 0.35 + 0.6 * tw[star]
+    P[star] = STAR
+    # distant tree line hugging the horizon
+    canopy = HOR - 14 - 16 * (0.5 + 0.5 * np.sin(X / 23)) * (0.6 + 0.4 * np.sin(X / 7.3 + 1.7))
+    trees = (Y > canopy) & (Y <= HOR)
+    L[trees] = 0.04
+    P[trees] = TREE
+    # ground: back-project each pixel below the horizon to road coordinates
+    g = Y > HOR + 0.5
+    z = np.where(g, F * EYE / np.maximum(Y - HOR, 0.5), 1e9)
+    xw = (X - VPX) * z / F
+    zt = z + travel
+    on_road = g & (np.abs(xw) < 3.2)
+    grass = g & ~on_road
+    L[grass] = np.where(hash2(np.floor(xw * 2), np.floor(zt * 2)) > 0.93, 0.4, 0.05)[grass] / (1 + z[grass] / 40)
+    P[grass] = GRASS
+    L[on_road] = np.where(hash2(np.floor(xw * 4), np.floor(zt * 4)) > 0.97, 0.35, 0.05)[on_road]
+    P[on_road] = ROAD
+    edge = on_road & (np.abs(np.abs(xw) - 3.0) < 0.12)
+    L[edge] = 0.6 / (1 + z[edge] / 60)
+    dash = on_road & (np.abs(xw) < 0.09) & (z > 8) & ((zt / STEP_M) % 1.0 < 0.5)  # one dash cycle per stride
+    L[dash] = 0.95 / (1 + z[dash] / 60)
+    P[dash] = DASH
+        # streetlamps 2 strides apart on both sides, staggered by one stride
+    spacing = STEP_M * STRIDES
+    glow = np.zeros_like(L)
+    for side, off in ((-1, 0.0), (1, STEP_M)):
+        for k in range(14):
+            zl = 5.0 + off + k * spacing - (travel % spacing)
+            if zl < 5.0:
+                zl += 14 * spacing
+            x0, base, top = VPX + side * F * 5.0 / zl, HOR + F * EYE / zl, HOR - F * (5.0 - EYE) / zl
+            post = (np.abs(X - x0) < max(0.6, F * 0.09 / zl)) & (Y > top) & (Y < base)
+            L[post] = np.maximum(L[post], 0.5 / (1 + zl / 25))
+            P[post] = POST
+            hr = max(3.0, F * 0.12 / zl)  # tight halo around the lamp head
+            glow += 1.2 * np.exp(-(((X - x0) ** 2 + (Y - top) ** 2) / hr ** 2)) / (1 + zl / 40)
+            pool = g & ((xw - side * 4.2) ** 2 + (z - zl) ** 2 < 4)  # light pool on the ground
+            L[pool] += 0.0
+    L += glow
+    P[glow > 0.2] = GLOW
+
+def dilate(m, rx, ry):
+    """Binary dilation by shifting; wrap-around at the borders is harmless (figure is central)."""
+    out = m.copy()
+    for dy in range(-ry, ry + 1):
+        for dx in range(-rx, rx + 1):
+            out |= np.roll(m, (dy, dx), (0, 1))
+    return out
+
+def girl(X, Y, t, L, P, hair_aux):
+    """t: phase within one stride (0..1). Painted back to front: legs, skirt, bodice, arms, waist bow, hair, head bow.
+    Phase is offset so frame 0 is a full stride (not the passing pose) and f0/f6 are mirror strides."""
+    p = 2 * np.pi * t + np.pi / 2
+    cx, sway, bob = W * 0.54 + 5 * np.sin(p), 5 * np.sin(p), -4 * (1 - np.cos(2 * p)) / 2
+    G = 588.0
+
+    def paint(mask, lum, part, gap=False):
+        if gap:  # one-cell void around the part so neighbours keep a visible edge
+            ring = dilate(mask, 3, 2) & ~mask
+            L[ring], P[ring] = 0, SKY
+        L[mask] = lum[mask] if isinstance(lum, np.ndarray) else lum
+        P[mask] = part
+
+    L[ellipse(X, Y, cx, G + 2, 70, 9) < 1] *= 0.45  # contact shadow
+    # legs: forward foot is further away so it sits higher and smaller; the trailing heel lifts, sole showing
+    for side, ph in ((-1, p), (1, p + np.pi)):
+        fwd = max(0.0, np.sin(ph))
+        ax = cx + side * 17 - sway * 0.4
+        ankle_y = G - 10 - 26 * fwd
+        lift = 20 * max(0.0, -np.sin(ph + 0.6))
+        end_y = ankle_y - lift
+        paint(capsule(X, Y, ax, 430, ax + side * 2, end_y, 6), 0.8, SKIN)
+        paint(capsule(X, Y, ax, 515, ax + side * 2, end_y, 6.5), 0.95 - 0.12 * (np.abs(X - ax) / 7), SOCK)
+        shoe = ellipse(X, Y, ax + side * 2, end_y + 5, 9 - 2 * fwd, 6 - 1.5 * fwd) < 1
+        paint(shoe, 0.3 + 0.25 * np.clip((end_y - Y) / 8 + 1, 0, 1), SHOE)
+        if lift > 4:
+            paint(shoe & (Y > end_y + 5), 0.85, SHOE)
+
+    # skirt: flares from a nipped waist, scalloped lace hem, two ruffle tiers shown as light bands
+    wy, hy = 300 + bob, 430 + bob
+    v = np.clip((Y - wy) / (hy - wy), 0, 1)
+    scx = cx + sway * 1.6 * v ** 1.5 - 4 * np.sin(p - 0.8) * v
+    hw = 30 + 80 * v ** 0.8
+    u = (X - scx) / hw
+    hem = hy + 7 * np.abs(np.sin((X - scx) / 11))
+    skirt = (Y > wy) & (Y < hem) & (np.abs(u) < 1)
+    tiers = sum(np.exp(-((Y - (wy + d) - 5 * np.abs(np.sin((X - scx) / 9))) / 4) ** 2) for d in (42, 86))
+    shade = 0.62 + 0.3 * (1 - u ** 2) + 0.08 * np.sin(u * 15 + 2 * np.sin(p)) - 0.75 * tiers
+    paint(skirt, np.clip(shade, 0, 1), DRESS, gap=True)
+    lace = (np.abs(u) < 1.02) & (Y > hem - 3) & (Y < hem + 9)
+    paint(lace, 0.25 + 0.2 * (hash2(np.floor(X / 4), np.floor(Y / 4)) > 0.5), LACE)
+    # bodice: shoulders taper to the waist
+    k_b = np.clip((Y - 215 - bob) / (wy - 215 - bob), 0, 1)
+    bod = (Y > 215 + bob) & (Y < wy + 2) & (np.abs(X - cx) < 52 - 27 * k_b ** 0.8)
+    paint(bod, 0.75 + 0.2 * (1 - ((X - cx) / 52) ** 2), DRESS, gap=True)
+    # arms hang outside the torso and swing opposite the legs; puff sleeves on the shoulders
+    for side in (-1, 1):
+        sv = np.sin(p) * -side  # same-side leg forward (sin>0 for side -1) means this arm swings back
+        sx, sy = cx + side * 58, 228 + bob
+        hx, hy2 = sx + side * (24 + 4 * sv), 392 + bob - 30 * sv
+        paint(capsule(X, Y, sx + side * 4, sy + 10, hx, hy2, 5), 0.85, SKIN, gap=True)
+        paint(ellipse(X, Y, hx, hy2 + 4, 6, 8) < 1, 0.9, SKIN)
+        puff = ellipse(X, Y, sx, sy, 20, 17) < 1
+        paint(puff, 0.62 + 0.3 * (1 - ellipse(X, Y, sx - side * 5, sy - 6, 20, 17).clip(0, 1)), DRESS, gap=True)
+        paint((ellipse(X, Y, sx, sy + 14, 22, 6) < 1) & (Y > sy + 11), 0.3, LACE)
+    # waist bow: loops reach well past the hair on both sides
+    by = 312 + bob
+    for side in (-1, 1):
+        d = ellipse(X, Y, cx + side * 52, by, 36, 16, side * 0.25)
+        paint(d < 1, 0.45 + 0.5 * np.clip(d, 0, 1) ** 2, BOW, gap=True)
+
+    # hair: its own narrow column; roots fixed, tips swing late (follow-through, doubled amplitude)
+    k = np.clip((Y - 190 - bob) / 240, 0, 1) ** 1.5
+    hcx = cx + (sway * 1.5 + 24 * np.sin(p - (Y - 200) / 120)) * k
+    yy = Y - bob
+    hwh = np.select(
+        [yy < 165, yy < 205, yy < 300],
+        [40 * np.sqrt(np.clip(1 - ((yy - 165) / 47) ** 2, 0, 1)), 40 - (yy - 165) * 0.2, 32 + (yy - 205) * 0.085],
+        40 - (yy - 300) * 0.05,
+    )
+    hwh = hwh * (1 + 0.04 * np.sin(yy / 13 + p))
+    uh = (X - hcx) / np.maximum(hwh, 1)
+    tips = 352 + bob + 26 * (1 - uh ** 2) + 10 * np.sin(uh * 9.7) + 6 * np.sin(uh * 23 + p)
+    hair = (np.abs(uh) < 1) & (Y > 118 + bob) & (Y < tips)
+    sfield = uh * 40 + 2.5 * np.sin(yy / 47 + uh * 3)
+    strands = 0.5 + 0.5 * np.sin(sfield)
+    fine = 0.5 + 0.5 * np.sin(uh * 113 + yy / 31)
+    ring = np.exp(-((yy - (152 + 14 * uh ** 2)) / 9) ** 2) + 0.7 * np.exp(-((yy - (300 + 18 * uh ** 2)) / 9) ** 2)
+    lum = (0.22 + 0.3 * strands + 0.12 * fine) * (0.65 + 0.35 * (1 - uh ** 2)) + 0.45 * ring
+    lum = lum * np.clip((tips - Y) / 18, 0.2, 1)  # tips thin out
+    paint(hair, lum, HAIR, gap=True)
+    # strand tangent (doubled-angle vector, so opposite directions average sensibly) for direction-aware glyphs
+    gy, gx = np.gradient(sfield)
+    phi2 = 2 * np.arctan2(-gy, gx)
+    hair_aux[0][hair], hair_aux[1][hair], hair_aux[2][hair] = np.cos(phi2)[hair], np.sin(phi2)[hair], np.clip(ring, 0, 1)[hair]
+    # bow on the back of the head, tails trailing down over the hair
+    hby = 124 + bob
+    for side in (-1, 1):
+        d = ellipse(X, Y, cx + side * 36, hby, 38, 21, side * 0.35)
+        paint(d < 1, 0.55 + 0.4 * np.clip(d, 0, 1), BOW, gap=True)
+    paint(ellipse(X, Y, cx, hby, 10, 10) < 1, 0.95, BOW, gap=True)
 
 def frame(f):
-    grid = [[(" ", "bg") for _ in range(COLS)] for _ in range(ROWS)]
-    phase = f // 2  # road scrolls toward the viewer
-    for c, ch in enumerate(("_.-^-._,.-^^-.,_" * 4)[:COLS]):
-        grid[HORIZON][c] = (ch, "grass")
-    for r in range(HORIZON + 1, ROWS):
-        d = round((r - HORIZON) * 1.1)
-        for c, ch in ((MID - d, "/"), (MID + d, "\\")):
-            if 0 <= c < COLS:
-                grid[r][c] = (ch, "road")
-        if (r - phase) % 4 < 2:
-            grid[r][MID] = ("|", "line")
-        if (r - phase) % 4 == 0:
-            for c in (MID - d - 3, MID + d + 3):
-                if 0 <= c < COLS:
-                    grid[r][c] = (",", "grass")
-    rows, top = girl(f)
-    x0 = MID - 4  # walks just right of the centre line
-    for i, (text, part) in enumerate(rows):
-        for c in range(x0, x0 + len(text)):  # no road markings peeking through gaps in her outline
-            if grid[top + i][c][1] in ("line", "grass"):
-                grid[top + i][c] = (" ", "bg")
-        first, last = len(text) - len(text.lstrip()), len(text.rstrip())
-        for j in range(first, last):  # her silhouette hides the road behind her
-            if 0 <= x0 + j < COLS:
-                grid[top + i][x0 + j] = (text[j], part)
-    return grid
+    """Returns (chars, colours) grids for frame f."""
+    ys, xs = ((np.arange(n * SS) + 0.5) / SS for n in (ROWS, COLS))
+    X, Y = np.meshgrid(xs * CW, ys * LH)
+    L, P = np.zeros_like(X), np.zeros(X.shape, int)
+    aux = [np.zeros_like(X) for _ in range(3)]  # hair strand tangent (cos2a, sin2a) and highlight
+    background(X, Y, (f % NF) / NF, L, P)
+    girl(X, Y, (f % STRIDE_FRAMES) / STRIDE_FRAMES, L, P, aux)
+    cell = lambda a: a.reshape(ROWS, SS, COLS, SS).mean(axis=(1, 3))
+    lum = np.clip(cell(np.clip(L, 0, 1)), 0, 1)
+    onehot = np.eye(len(COLOURS))[P]  # majority part per cell decides its colour
+    part = onehot.reshape(ROWS, SS, COLS, SS, -1).mean(axis=(1, 3)).argmax(-1)
+    cov = cell(np.isin(P, GIRL_PARTS).astype(float))
+    fig = cov > 0.4
+    # figure: heavy end of the ramp; background: anything dim is empty space
+    lum = np.where(fig, lum, np.clip((lum - 0.18) / 0.82, 0, 1))
+    lum = np.clip(lum, 0, 1) ** np.where(fig, 0.85, 1.25)
+    idx = np.round(lum * (len(RAMP) - 1)).astype(int)
+    chars = np.array(list(RAMP))[idx]
+    chars = np.where(fig, chars, np.array(list(" .,:'*+*"))[np.minimum(idx // 2, 7)])  # scene marks stay small
+    col = COLOURS[part] * (0.8 + 0.2 * lum[..., None])
+    # hair: strand glyphs follow the local strand angle; shadows get dense letters, tips and gaps stay light
+    hc, hs, hr = (cell(a) for a in aux)
+    hairc = fig & (part == HAIR)
+    phi = np.degrees(np.arctan2(hs, hc) / 2)  # strand angle from vertical, +ve leans down-right
+    rnd = hash2(np.arange(COLS)[None, :] + 3.0, np.arange(ROWS)[:, None] + 5.0)
+    vert = np.array(list("|l|I!|"))[(rnd * 6).astype(int)]
+    strand = np.where(np.abs(phi) < 9, vert, np.where(phi > 0, "\\", "/"))
+    shadow = np.array(list("B8M0Z"))[(rnd * 5).astype(int)]
+    tip = np.array(list(",.:;|"))[(rnd * 5).astype(int)]
+    hg = np.where(hr > 0.35, np.array(list("@W"))[(rnd * 2).astype(int)],
+                  np.where(lum < 0.2, tip, np.where(lum < 0.45, shadow, strand)))
+    chars = np.where(hairc, hg, chars)
+    col[hairc & (hr > 0.35)] = col[hairc & (hr > 0.35)] * 0.4 + 255 * 0.6
+    return chars, np.clip(col, 0, 255).astype(int)
 
-CH_W, LINE_H, PAD = 9.6, 16, 18
-W, H = COLS * CH_W + PAD * 2, ROWS * LINE_H + PAD * 2 + 26
+def render(f):
+    img = Image.new("RGB", (round(W), round(H) + 22), (18, 14, 24))
+    d = ImageDraw.Draw(img)
+    chars, col = frame(f)
+    for r in range(ROWS):
+        for c in range(COLS):
+            if chars[r, c] != " ":
+                d.text((c * CW, r * LH), chars[r, c], font=FONT, fill=tuple(col[r, c]))
+    cap = ImageFont.truetype("/usr/share/fonts/truetype/freefont/FreeMono.ttf", 13)
+    d.text((W / 2, H + 11), "♪ now playing: cry — aisin-gioro & toyoki", font=cap, fill=(185, 163, 196), anchor="mm")
+    return img
 
-def svg_frame(f, grid):
-    lines = []
-    for r, row in enumerate(grid):
-        runs, cur, buf = [], None, ""
-        for ch, part in row + [("", None)]:
-            if part != cur and buf:
-                runs.append(f'<tspan class="{cur}">{escape(buf)}</tspan>')
-                buf = ""
-            cur, buf = part, buf + ch
-        lines.append(f'<tspan x="{PAD}" y="{PAD + (r + 1) * LINE_H}">{"".join(runs)}</tspan>')
-    return f'<text class="f" style="animation-delay:-{CYCLE - f * CYCLE / N:.3f}s">{"".join(lines)}</text>'
-
-FRAMES = [frame(f) for f in range(N)]
-assert all(len(g) == ROWS and all(len(r) == COLS for r in g) for g in FRAMES)
-
-svg = f'''<svg xmlns="http://www.w3.org/2000/svg" width="{W:.0f}" height="{H:.0f}" viewBox="0 0 {W:.0f} {H:.0f}" role="img" aria-label="ASCII girl with long hair and a bow walking away down a night road, looping">
-<style>
-text{{font:16px ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;white-space:pre}}
-.f{{opacity:0;animation:show {CYCLE}s steps(1) infinite}}
-@keyframes show{{0%{{opacity:1}}{100 / N:.2f}%,100%{{opacity:0}}}}
-.bg{{fill:none}} .road{{fill:#5d5470}} .line{{fill:#e9d48a}} .grass{{fill:#4f7a5c}}
-.bow{{fill:#ff7aa8}} .hair{{fill:#cdb8ea}} .dress{{fill:#f6d3e2}} .legs{{fill:#bfaecb}}
-.cap{{fill:#b9a3c4;font-size:13px}}
-</style>
-<rect width="100%" height="100%" rx="12" fill="#120e18"/>
-{"".join(svg_frame(f, g) for f, g in enumerate(FRAMES))}
-<text class="cap" x="50%" y="{H - PAD}" text-anchor="middle">&#9834; now playing: cry &#8212; aisin-gioro &amp; toyoki</text>
-</svg>
-'''
 if __name__ == "__main__":
-    Path(__file__).with_name("walk.svg").write_text(svg)
-    for f in (0, 2, 4, 6):
-        print(f"--- frame {f}")
-        print("\n".join("".join(ch for ch, _ in r) for r in FRAMES[f]))
+    a, b = frame(0), frame(NF)
+    assert (a[0] == b[0]).all(), "loop must wrap cleanly"
+    frames = [render(f) for f in range(NF)]
+    pal = frames[0].quantize(colors=128, method=Image.Quantize.MEDIANCUT)
+    frames = [fr.quantize(palette=pal, dither=Image.Dither.NONE) for fr in frames]
+    out = Path(__file__).with_name("walk.gif")
+    frames[0].save(out, save_all=True, append_images=frames[1:], duration=FRAME_MS, loop=0, optimize=True)
+    print(out, f"{out.stat().st_size / 1e6:.2f} MB", f"{NF} frames", f"{round(W)}x{round(H) + 22}")

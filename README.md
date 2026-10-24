@@ -1,4 +1,4 @@
-<p align="center"><img src="assets/walk.svg" alt="ASCII girl with long hair and a bow walking away down a night road, to Cry by Aisin-Gioro and Toyoki" width="497"></p>
+<p align="center"><img src="assets/walk.gif" alt="ASCII girl with long hair and a bow walking away down a night road, to Cry by Aisin-Gioro and Toyoki" width="865"></p>
 
 # hey, I'm rijul 👋
 
