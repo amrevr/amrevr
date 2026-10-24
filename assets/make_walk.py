@@ -1,4 +1,5 @@
-"""Generates walk.gif: a shaded-ASCII loop of an original girl who whips round, flips her hair and walks away down a night road.
+"""Generates walk.gif: a shaded-ASCII loop of an original girl who faces the camera, does a little jig, spins away with a hair whip,
+walks off down a night road, then turns back to face the camera again.
 
 The scene is drawn as luminance + part maps, shaded into RGB, then box-averaged over small square cells
 in the manner of ezascii.com: each cell picks a glyph by luminance ** exponent and is inked in its own colour. Everything is periodic in the loop phase, so it loops cleanly.
@@ -12,7 +13,13 @@ from PIL import Image, ImageDraw, ImageFont
 
 COLS, ROWS, SS, CELL = 173, 120, 3, 5  # square character grid (CELL px pitch), supersamples per cell side
 STRIDE_FRAMES, STRIDES, FRAME_MS = 14, 2, 80  # base cadence: 14 frames per stride (two steps); she covers exactly 2 strides (= the lamp spacing) per loop
-NF, WALK_FROM, WIND_FROM, STOP_AT = 49, 12, 38, 46  # loop length; left heel strike; wind-down start; standstill (frames 46..48 rest, then the intro again)
+# ---- segment boundaries (frames at 80 ms; yaw 180 = facing the camera, 0 = back) ----
+IDLE_N = 6                     # 0..5   front idle: hands at the chest bow, breathing, one blink
+JIG_FROM, JIG_N = 6, 18        # 6..23  the jig: two knee-dips, hip sway, shoulder shimmy, head tilts, a wave
+TURN_FROM = 24                 # 24..25 anticipation crouch, 26..28 spin to the back, 29..33 overshoot and settle
+WALK_FROM = 32                 # left heel strike, during the settle; gait cadence starts 2 frames earlier
+WIND_FROM, STOP_AT = 49, 57    # wind-down start; standstill (frame 57 stands with her back to us)
+RET_FROM, NF = 58, 68          # 58..59 small crouch, 60..62 spin to the front, 63..67 settle; frame NF is frame 0 again
 FONT = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 8)  # glyphs are centred, so the 4.8 px advance is harmless
 CW = LH = CELL
 W, H = COLS * CW, ROWS * LH
@@ -26,7 +33,7 @@ BG_CUT = 0.02  # only true blacks are left empty
 BG_FLOOR, BG_GAIN = 0.12, 3.0  # scene shading: dim L still shows its colour; BG_GAIN stretches the faint L of sky/grass/road
 HAIR_TIP, HAIR_SHADOW = 0.12, 0.3  # hair luminance below which glyphs are tip marks / dense letters
 
-SKY, STAR, TREE, GRASS, ROAD, DASH, POST, GLOW, HAIR, HAIR_S, BOW, BOW_S, BLOUSE, TRIM, SKIRT, SKIRT_S, RUFFLE, SKIN, SOCK, SHOE = range(20)
+SKY, STAR, TREE, GRASS, ROAD, DASH, POST, GLOW, HAIR, HAIR_S, BOW, BOW_S, BLOUSE, TRIM, SKIRT, SKIRT_S, RUFFLE, SKIN, SOCK, SHOE, PUPIL, BLUSH, LIP = range(23)
 COLOURS = np.array([
     (70, 50, 140), (255, 245, 215), (35, 95, 65), (45, 125, 65), (125, 105, 165), (250, 215, 110),
     (110, 100, 150), (255, 215, 150),
@@ -34,9 +41,10 @@ COLOURS = np.array([
     (201, 168, 245), (189, 164, 180),         # bow / ribbon, shade
     (253, 250, 251), (43, 58, 107),           # blouse, navy trim
     (201, 168, 245), (112, 74, 206), (204, 198, 205),  # skirt, skirt shadow, ruffle
-    (230, 186, 186), (250, 250, 252), (90, 52, 35),    # skin, sock, loafer
+    (241, 207, 198), (250, 250, 252), (90, 52, 35),    # skin, sock, loafer
+    (58, 40, 78), (250, 130, 160), (215, 80, 110),     # eyes, blush, lips
 ], float)
-GIRL_PARTS = list(range(HAIR, SHOE + 1))
+GIRL_PARTS = list(range(HAIR, LIP + 1))
 
 # camera: horizon line, focal length (px), eye height (m); she walks 1.4 m per stride
 HOR, VPX, F, EYE, STEP_M = 230.0, W * 0.47, 626.0, 1.3, 1.4
@@ -147,71 +155,127 @@ def round_lum(s, lo, hi):
     """Round-limb shading: lit from the left, falling off toward the far edge."""
     return lo + (hi - lo) * np.exp(-((s + 0.35) / 0.9) ** 2)
 
-# ---- timeline: intro (turn-back whip) -> walk -> wind-down, one pose per frame ----
+# ---- timeline: front idle -> jig -> spin away -> walk -> wind-down -> spin back to the front, one pose per frame ----
 @dataclass
 class Pose:
-    """Everything that changes between frames. The defaults are the standing rest pose (frame 0 and the last frames)."""
+    """Everything that changes between frames. The defaults are the front idle pose (frame 0 and frame NF)."""
+    t: float = 0.0         # frame number; only drives the hands' fidget, which is periodic in the loop
     fl: float = 0.0        # gait phase, radians (frame WALK_FROM is the left heel strike = 0)
     amp: float = 0.0       # walk amplitude 0..1: bob, sway, twist, arm swing, hair/ribbon/hem lag
     travel: float = 0.0    # metres walked since frame 0
-    yaw_hip: float = 0.0   # turn about the vertical axis, radians, + = toward screen-left; the shoulders and head lead the hips
-    yaw_sh: float = 0.0
-    yaw_head: float = 0.0
-    dip: float = 0.0       # anticipation: shoulders dip 0.01 H and the head tilts 3 degrees, at dip = 1
-    near: float = 0.0      # 0..1 blend of the near (screen-left) arm toward "swung out" and the far hand toward the hip
+    yaw_hip: float = np.pi  # turn about the vertical axis, radians: 0 = back to us, pi = facing us, + = the face swings toward screen-left;
+    yaw_sh: float = np.pi   # the shoulders and head lead the hips
+    yaw_head: float = np.pi
+    squat: float = 0.0     # knee bend 0..1 (the body drops 0.03 H at 1)
+    tuck: float = 0.0      # front: hands pulled in to the chest (anticipation)
+    near: float = 0.0      # 0..1 blend of the near arm toward "swung out" and the far hand toward the hip (front: out wide, both)
     far: float = 0.0
+    sway: float = 0.0      # hips shift sideways, fractions of H, + = screen-right
+    shim: float = 0.0      # shoulder roll, radians (the shimmy)
+    htilt: float = 0.0     # head tilt, radians, + = crown toward screen-right
+    wave: float = 0.0      # 0..1 right hand raised from the bow, waving at phase wph
+    wph: float = 0.0
+    blink: float = 0.0
+    bob: float = 0.0       # breathing, fractions of H
+    fan: float = 0.0       # spin speed 0..1: the hair and hem fan out
     whip: float = 0.0      # hair tip angle off the spine, radians, + = streaming toward screen-left
     tail_x: float = 0.0    # ribbon tail tip offset, fractions of H, + = screen-right
     flare: float = 0.0     # extra hem flare 0..1 (0.29 H -> 0.34 H wide) with a 5 degree tilt
     hem_x: float = 0.0     # hem lag offset, fractions of H
+    bounce: float = 0.0    # vertical lag of the hair tips, signed
 
-# The move, keyed per frame (80 ms): yaw in degrees (+ = toward screen-left, she turns back to profile and returns), shoulder dip,
-# near arm swinging out, far hand to the hip. Catmull-Rom between keys; everything is at rest after the last row.
-SH_LEAD, HEAD_LEAD = 0.25, 0.5  # shoulders and head sample the yaw curve this many frames ahead of the hips (about 10 degrees mid-turn)
-INTRO = np.array([
-    # frame yaw  dip near far
-    [0,       0,  0.0, 0.0, 0.0],   # rest
-    [1,       0,  1.0, 0.0, 0.0],   # anticipation
-    [2,      38,  0.3, 0.6, 0.5],   # fast ease-out turn ...
-    [3,      62,  0.0, 0.9, 0.9],
-    [4,      70,  0.0, 1.0, 1.0],
-    [5,      72,  0.0, 1.0, 1.0],   # profile hold, hair at full stream
-    [6,      58,  0.0, 0.9, 1.0],   # ... and back
-    [7,      25,  0.0, 0.5, 0.6],
-    [8,       3,  0.0, 0.1, 0.2],
-    [9,       0,  0.0, 0.0, 0.0],   # settle
-    [10,      0,  0.0, 0.0, 0.0],
-])[:, 1:]
-SPRING_W, SPRING_ZETA = np.array([13.0, 8.0, 10.0]), np.array([0.3, 0.3, 0.35])  # hair, ribbons, skirt: natural frequency (rad/s), damping
-SPRING_GAIN = np.array([3.3, 0.08, 0.9])  # hair angle (rad per rad), ribbon offset (H per rad), skirt (flare per rad)
+# The two spins, keyed per frame (80 ms): yaw in degrees (+ = the face swings toward screen-left), knee bend, hands tucked in at the chest,
+# the near / far arm swinging out. Catmull-Rom between neighbouring frames; before the first key she faces us, and a gap between keys holds the
+# earlier one (walk). The jig and the idle are parametric (jig_at, pose_at).
+SH_LEAD, HEAD_LEAD = 0.25, 0.5  # shoulders and head sample the yaw curve this many frames ahead of the hips
+KEYS = {
+    # frame  yaw  squat tuck near far
+    23: (180,  0.0, 0.0, 0.0, 0.0),   # the jig ends upright
+    24: (180,  0.6, 1.0, 0.0, 0.0),   # anticipation: dip, hands pull in
+    25: (180,  1.0, 1.0, 0.0, 0.0),   #
+    26: (136,  0.3, 0.2, 0.6, 0.6),   # fast ease-out spin, head ahead of the shoulders, shoulders ahead of the hips; arms fling out
+    27: ( 62,  0.0, 0.0, 1.0, 1.0),
+    28: (  8,  0.0, 0.0, 1.0, 1.0),
+    29: (-14,  0.0, 0.0, 0.9, 0.9),   # overshoots past the back view ...
+    30: ( -5,  0.0, 0.0, 0.6, 0.6),
+    31: (  2,  0.0, 0.0, 0.3, 0.3),   # ... and settles; the first step lands at WALK_FROM
+    32: (  0,  0.0, 0.0, 0.1, 0.1),
+    33: (  0,  0.0, 0.0, 0.0, 0.0),
+    58: (  0,  0.4, 0.0, 0.0, 0.0),   # the return: a light dip ...
+    59: (  0,  0.7, 0.0, 0.0, 0.0),
+    60: (-58,  0.2, 0.0, 0.5, 0.5),   # ... and a quicker spin the other way round, through the right-hand profile
+    61: (-134, 0.0, 0.0, 0.8, 0.8),
+    62: (-188, 0.0, 0.0, 0.6, 0.6),   # a little overshoot
+    63: (-173, 0.0, 0.0, 0.3, 0.3),
+    64: (-182, 0.0, 0.0, 0.1, 0.1),
+    65: (-180, 0.0, 0.0, 0.0, 0.0),   # landed on the front idle pose
+    66: (-180, 0.0, 0.0, 0.0, 0.0),
+    67: (-180, 0.0, 0.0, 0.0, 0.0),
+    68: (-180, 0.0, 0.0, 0.0, 0.0),   # = frame 0 again (yaw -180 is yaw 180)
+}
+KF = sorted(KEYS)
+KV = np.array([KEYS[k] for k in KF], float)
 
-def intro_keys(f):
-    """Catmull-Rom through INTRO at (fractional) frame f: yaw (deg), dip, near, far."""
-    K = np.vstack([np.zeros((1, 4)), INTRO, np.zeros((2, 4))])
-    i = int(np.floor(f))
-    if i < 0 or i >= len(INTRO) - 1:
-        return np.zeros(4)
-    u = f - i
-    p0, p1, p2, p3 = K[i], K[i + 1], K[i + 2], K[i + 3]
+def keys_at(f):
+    """Catmull-Rom through KEYS at (fractional) frame f: yaw (deg), squat, tuck, near, far."""
+    if f < KF[0]:
+        return KV[0]
+    if f >= KF[-1]:
+        return KV[-1]
+    i = max(j for j in range(len(KF)) if KF[j] <= f)
+    if KF[i + 1] - KF[i] > 1:
+        return KV[i]
+    u = f - KF[i]
+    p1, p2 = KV[i], KV[i + 1]
+    p0 = KV[i - 1] if i > 0 and KF[i] - KF[i - 1] == 1 else p1
+    p3 = KV[i + 2] if i + 2 < len(KF) and KF[i + 2] - KF[i + 1] == 1 else p2
     k = 0.5 * ((2 * p1) + (p2 - p0) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u ** 2 + (3 * p1 - p0 - 3 * p2 + p3) * u ** 3)
-    return np.maximum(k, 0)  # the spline would undershoot rest slightly; she never counter-turns
+    return np.concatenate([k[:1], np.maximum(k[1:], 0)])  # the spline must not undershoot rest on the knees and arms
+
+JIG_SQUAT, JIG_SWAY = 0.8, 0.022  # two dips this deep; the hips swing this far (H) from side to side, once across both dips
+def jig_at(f):
+    """The jig, parametric over JIG_FROM .. JIG_FROM + JIG_N: sway, shoulder roll, head tilt, knee bend, wave amount and phase.
+    Everything is 0 at both ends. Two dips (u = 0.25, 0.75) with the hips swung to opposite sides on them; four shoulder shimmies;
+    the head tilts left then right; the right hand leaves the bow between u = 0.3 and 0.88 to wave."""
+    u = (f - JIG_FROM) / JIG_N
+    if not 0 < u < 1:
+        return np.zeros(6)
+    env = smooth(min(u, 1 - u) * 6)
+    return np.array([JIG_SWAY * np.sin(2 * np.pi * u) * env, np.radians(5) * np.sin(2 * np.pi * 4 * u) * env,
+                     -np.radians(9) * np.sin(2 * np.pi * u) * env, JIG_SQUAT * (0.5 - 0.5 * np.cos(4 * np.pi * u)),
+                     smooth((u - 0.30) / 0.10) * smooth((0.88 - u) / 0.10), 2 * np.pi * 4 * u])
+
+def squat_at(f):
+    return keys_at(f)[1] + jig_at(f)[3]
+
+# hair, ribbons, skirt, vertical lag: natural frequency (rad/s), damping, gain (hair angle per rad, ribbon offset H per rad, skirt flare per rad, lag per unit)
+SPRING_W, SPRING_ZETA = np.array([13.0, 8.0, 10.0, 11.0]), np.array([0.3, 0.3, 0.35, 0.35])
+SPRING_GAIN = np.array([3.3, 0.08, 0.9, 2.0])
+SWAY_COUPLE, RET_GAIN = 8.0, 0.6  # head sway (H) counts this much as yaw (rad) for the springs; the return spin drives them this much as the first
 
 def springs():
-    """Hair, ribbons and skirt as damped springs driven by the head's yaw acceleration: a'' = -yaw'' - 2 zeta w a' - w^2 a.
-    The turn starts, they lag; the turn stops, they swing on; the turn back overshoots; ~1.5 swings later they are still."""
+    """Hair, ribbons and skirt as damped springs driven by the head's yaw acceleration (and its sideways sway): a'' = -drive'' - 2 zeta w a' - w^2 a.
+    The turn starts, they lag; the turn stops, they swing on; the turn back overshoots; ~1.5 swings later they are still. A fourth spring is
+    driven by the vertical acceleration of the knee dips. Outputs are soft-limited, and fade out over the last 3 frames so the loop closes."""
     sub = 16
     dt = FRAME_MS / 1000 / sub
-    yaw = lambda f: np.radians(intro_keys(f + HEAD_LEAD)[0])
-    a, v, out = np.zeros(3), np.zeros(3), [np.zeros(3)]
+    def drive(f):
+        yaw = np.radians(keys_at(f + HEAD_LEAD)[0]) * (RET_GAIN if f >= RET_FROM - 1 else 1)
+        hx = 0.5 * jig_at(f)[0] + 0.07 * np.sin(jig_at(f)[2])
+        return np.array([yaw + SWAY_COUPLE * hx, squat_at(f)])
+    a, v, out = np.zeros(4), np.zeros(4), [np.zeros(4)]
     for i in range(NF * sub):
         f = i / sub
-        acc = (yaw(f + 1 / sub) - 2 * yaw(f) + yaw(f - 1 / sub)) / dt ** 2
+        acc = (drive(f + 1 / sub) - 2 * drive(f) + drive(f - 1 / sub)) / dt ** 2
+        acc = np.array([acc[0], acc[0], acc[0], acc[1]])
         v += dt * (-acc - 2 * SPRING_ZETA * SPRING_W * v - SPRING_W ** 2 * a)
         a += dt * v
         if (i + 1) % sub == 0:
             out.append(a.copy())
     out = np.array(out) * SPRING_GAIN
-    out[np.abs(out) < 2e-3] = 0  # sub-pixel residue: lets the loop close exactly
+    out[:, 0], out[:, 1] = 1.45 * np.tanh(out[:, 0] / 1.45), 0.3 * np.tanh(out[:, 1] / 0.3)
+    out *= smooth((NF - np.arange(NF + 1)) / 3)[:, None]
+    out[np.abs(out) < 2e-3] = 0  # sub-pixel residue
     return out
 
 def gait():
@@ -219,22 +283,26 @@ def gait():
     its scale is solved so she covers exactly STRIDES strides, so travel wraps with the lamps and the road dashes."""
     f = np.arange(NF + 1)
     wind = smooth((STOP_AT - f) / (STOP_AT - WIND_FROM))
-    e = smooth((f - 10) / 5) * wind
+    e = smooth((f - (WALK_FROM - 2)) / 5) * wind
     c = e[:NF] * STRIDES / e[:NF].sum()               # strides per frame
     stride = np.concatenate([[0], np.cumsum(c)])      # strides walked since frame 0
     fl = 2 * np.pi * (stride - stride[WALK_FROM])     # heel strike at WALK_FROM
-    amp = (0.5 * smooth((f - 9) / 3) + 0.5 * smooth((f - WALK_FROM) / STRIDE_FRAMES)) * wind  # 50% -> 100% over the first 2 steps
+    amp = (0.5 * smooth((f - (WALK_FROM - 3)) / 3) + 0.5 * smooth((f - WALK_FROM) / STRIDE_FRAMES)) * wind  # 50% -> 100% over the first 2 steps
     return fl, amp, stride * STEP_M
 
 SPRING, (GAIT_FL, GAIT_AMP, GAIT_TRAVEL) = springs(), gait()
+BLINK_AT = (3,)  # one blink during the front idle
 
 def pose_at(f):
     """Pose at integer frame f in 0..NF (NF is the frame after the last, which must flow into frame 0)."""
-    _, dip, near, far = intro_keys(f)
-    yaw = lambda lead: np.radians(intro_keys(f + lead)[0])
-    whip, tail, skirt = SPRING[f]
-    return Pose(GAIT_FL[f], GAIT_AMP[f], GAIT_TRAVEL[f], yaw(0), yaw(SH_LEAD), yaw(HEAD_LEAD), max(dip, 0), near, far,
-                whip, -tail, min(abs(skirt), 1), -0.05 * np.sign(skirt) * min(abs(skirt), 1))
+    k, jg = keys_at(f), jig_at(f)
+    yaw = lambda lead: np.radians(keys_at(f + lead)[0]) % (2 * np.pi)  # an angle: -180 and 180 are the same bits
+    whip, tail, skirt, bounce = SPRING[f]
+    fan = min(abs(keys_at(f + 0.5)[0] - keys_at(f - 0.5)[0]) / 75, 1)
+    sk = min(abs(skirt), 1)
+    return Pose(f, GAIT_FL[f], GAIT_AMP[f], GAIT_TRAVEL[f], yaw(0), yaw(SH_LEAD), yaw(HEAD_LEAD), k[1] + jg[3], k[2], k[3], k[4],
+                jg[0], jg[1], jg[2], jg[4], jg[5], float(f in BLINK_AT), 0.005 * np.sin(np.pi * f / IDLE_N) if f < IDLE_N else 0.0, fan,
+                whip, -tail, min(sk + 0.8 * fan + 0.4 * min(abs(bounce), 1), 1), -0.05 * np.sign(skirt) * sk, bounce)
 
 def bend(X, Y, rx, ry, theta, length):
     """Straighten a hair spine that hangs from (rx, ry) and curls by theta (radians at its tip, growing as s**1.6, + = toward screen-left).
@@ -253,9 +321,19 @@ def bend(X, Y, rx, ry, theta, length):
     px, py = X - sx[bi], Y - sy[bi]
     return rx + px * ty[bi] - py * tx[bi], ry + ell[bi] + px * tx[bi] + py * ty[bi]
 
+def painter(L, P):
+    def paint(mask, lum, part, gap=False):
+        if gap:  # one-cell void around the part so neighbours keep a visible edge
+            ring = dilate(mask, 3, 3) & ~mask
+            L[ring], P[ring] = 0, SKY
+        L[mask] = lum[mask] if isinstance(lum, np.ndarray) else lum
+        P[mask] = part[mask] if isinstance(part, np.ndarray) else part
+    return paint
+
 def girl(X, Y, pz, L, P, hair_aux):
-    """pz: the Pose (gait phase, walk amplitude, intro turn and lags).
-    Painted back to front: legs, skirt, blouse, arms, sleeves, hair, ribbon tails, bow. Every length is a fraction of H."""
+    """pz: the Pose (gait phase, walk amplitude, spin, jig and lags). Facing us (cos of the shoulder yaw < 0) she is painted back to front:
+    hair, ribbon tails and bow behind her, legs, skirt, blouse, neck, head and face, arms, sleeves, side locks. From behind: legs, skirt, blouse,
+    arms, sleeves, hair, ribbon tails, bow. Every length is a fraction of H."""
     # ---- proportions (fractions of H, measured from the crown unless noted) ----
     G0, H = 556.0, 480.0                   # ground row under her at rest, body height in px (about 7.3 heads)
     HIP_H, LT, LS, FOOT = 0.488, 0.235, 0.225, 0.03  # hip height above ground, thigh, shin, ankle height
@@ -268,47 +346,311 @@ def girl(X, Y, pz, L, P, hair_aux):
     HIP_YAW, SH_YAW, SH_TILT, TWIST_GAIN = np.radians(10), np.radians(15), np.radians(5) * A, 1.8 * A
     ARM_SWING, HAIR_SWAY, TAIL_SWAY, HEM_SWAY = np.radians(25) * A, 0.035 * A, 0.06 * A, 0.03 * A
     HAIR_LAG, TAIL_LAG, HEM_LAG = 0.15 * 2 * np.pi, 0.25 * 2 * np.pi, 0.1 * 2 * np.pi
-    Yh, Ys, Yd = pz.yaw_hip, pz.yaw_sh, pz.yaw_head   # intro turn (0 in the walk)
-    cos_h = np.cos(Yh)
+    Yh, Ys, Yd = pz.yaw_hip, pz.yaw_sh, pz.yaw_head   # spin (0 = back; the walk's own twist is separate)
+    front = np.cos(Ys) < 0                 # facing us: the whole figure is drawn from the front
+    cos_h = abs(np.cos(Yh))
+    psi_s, psi_d = np.pi - Ys, np.pi - Yd  # angle off the camera axis, 0 = facing us (+ = the face swings toward screen-left)
     TW = np.hypot(np.cos(Ys), 0.6 * np.sin(Ys))        # torso is an ellipse (depth 0.6 of width): projected width through the turn
     SK = np.hypot(np.cos(Yh), 0.8 * np.sin(Yh))        # skirt is nearly round
 
     fl = pz.fl                             # left leg phase: 0 = heel strike (leg furthest forward)
     wrap = lambda a: a % (2 * np.pi)
     vm = lambda a, c, k: np.exp(k * (np.cos(a - c) - 1))   # periodic bump centred on c
+    paint = painter(L, P)
 
-    def paint(mask, lum, part, gap=False):
-        if gap:  # one-cell void around the part so neighbours keep a visible edge
-            ring = dilate(mask, 3, 3) & ~mask
-            L[ring], P[ring] = 0, SKY
-        L[mask] = lum[mask] if isinstance(lum, np.ndarray) else lum
-        P[mask] = part[mask] if isinstance(part, np.ndarray) else part
-
-    # ---- gait kinematics: thigh swing, knee flexion, hip height from the planted leg ----
+    # ---- gait and knee-dip kinematics: thigh swing, knee flexion, hip height from the planted leg ----
     leg = {}
     for side, ph in ((-1, fl), (1, fl + np.pi)):
-        th = np.radians(19) * A * np.cos(ph) + np.radians(2)
-        flex = np.radians(6 + A * (52 * vm(ph, 4.6, 2.5) + 8 * vm(ph, 0.35, 2.5)))
+        th = np.radians(19) * A * np.cos(ph) + np.radians(2) + np.radians(42) * pz.squat
+        flex = np.radians(6 + A * (52 * vm(ph, 4.6, 2.5) + 8 * vm(ph, 0.35, 2.5))) + np.radians(84) * pz.squat
         leg[side] = (th, flex, LT * np.cos(th) + LS * np.cos(th - flex) + FOOT)
-    hip_h = 0.5 * min(leg[-1][2], leg[1][2]) + 0.5 * HIP_H
-    dy = -(hip_h - HIP_H) * H + 0.01 * H * pz.dip  # the whole upper body rides the hip height (and dips before the turn)
-    hipx = -SWAY * H * np.sin(fl)          # pelvis shifts over the planted foot
+    k_plant = 0.5 + 0.5 * min(pz.squat, 1)  # in a dip both feet stay planted: the hips drop by the whole leg shortening
+    hip_h = k_plant * min(leg[-1][2], leg[1][2]) + (1 - k_plant) * HIP_H
+    dy = -(hip_h - HIP_H) * H - pz.bob * H  # the whole upper body rides the hip height
+    walk_x = -SWAY * H * np.sin(fl)        # pelvis shifts over the planted foot
+    jx = pz.sway * H                       # the jig's hip sway; the feet stay put
+    hipx = walk_x + jx
     cx = W * 0.54
-    pj = lambda lx, z, h, c, f=None: (c + lx * H, G0 - H * h - DEPTH * z * (max(0.35, 1 - h / 0.7) if f is None else f))
+    dirn = np.cos(Yh)                      # which way "forward" points on screen: up when she faces away, down when she faces us
+    pj = lambda lx, z, h, c, f=None: (c + lx * H, G0 - H * h - dirn * DEPTH * z * (max(0.35, 1 - h / 0.7) if f is None else f))
     top = G0 - H + dy                      # crown row
     yy = lambda frac: top + frac * H
 
     yaw_h, yaw_s = -HIP_YAW * np.cos(fl) * TWIST_GAIN, SH_YAW * np.cos(fl) * TWIST_GAIN  # + = right side turns away
     yaw_w, yaw_s = yaw_s, yaw_s + Ys       # walk twist alone vs. total shoulder yaw (sleeves, collar)
     tilt_h = HIP_TILT * np.sin(fl)         # + = right hip drops (it is the swing side)
-    tilt_s = np.tan(SH_TILT * np.cos(fl))  # forward-turning shoulder drops
-    shx = cx + hipx * 0.3 - 0.012 * H * np.sin(Ys)  # shoulders sway less than the hips; the chest bulges toward the turn
-    hdx = cx + hipx * 0.15 + 0.1 * H * np.radians(3) * pz.dip  # head
+    tilt_s = np.tan(SH_TILT * np.cos(fl) + pz.shim)  # forward-turning shoulder drops (walk); the shimmy rolls them in the jig
+    shx = cx + walk_x * 0.3 + jx * 0.5 + 0.1 * H * pz.shim - 0.012 * H * np.sin(Ys)  # shoulders sway less than the hips; the chest bulges toward the turn
+    hdx = cx + walk_x * 0.15 + jx * 0.7 + 0.1 * H * np.radians(3) * pz.squat  # head
+    hdx += 0.07 * H * np.sin(pz.htilt)     # the head tilts about the neck
     hrx = hdx + 0.04 * H * np.sin(Yd)      # the back of the head (hair, bow) swings away from the turn
     wv = np.clip((yy(0.50) - Y) / (yy(0.50) - yy(Y_SH)), 0, 1)
     bx = (cx + hipx) * (1 - wv) + shx * wv  # torso midline, hips -> shoulders
+    bowx, bowy = hrx + 0.028 * H * np.cos(Yd), yy(0.05)
 
-    L[ellipse(X, Y, cx + hipx * 0.5, G0 + 4, 80, 10) < 1] *= 0.45  # contact shadow
+    L[ellipse(X, Y, cx + walk_x * 0.5, G0 + 4, 80, 10) < 1] *= 0.45  # contact shadow
+
+    def back_upper():
+        """Seen from behind: sailor collar with its double stripe, arms swinging opposite the legs, puff sleeves."""
+        # ---- blouse: shoulders -> waist, shoulder line tilts and counter-rotates against the hips ----
+        Yw = Y - tilt_s * (X - bx) * smooth(wv * 1.1)   # inverse shoulder tilt
+        fy = (Yw - top) / H
+        half = interp_s(fy, [0.135, 0.16, Y_SH, 0.24, 0.31, Y_WAIST, 0.415], [0.040, 0.082, SH_HALF * np.cos(yaw_w), 0.088, 0.073, 0.066, 0.068]) * H * TW
+        blouse = (np.abs(X - bx) < half) & (fy > 0.135) & (fy < 0.415)
+        dxn = (X - bx) / np.maximum(half, 1)
+        paint(blouse, 0.82 + 0.15 * (1 - dxn ** 2) - 0.2 * smooth((np.abs(dxn) - 0.8) / 0.2), BLOUSE)
+        # square sailor collar on the back with a navy double stripe; its centre shifts with the shoulder yaw
+        cdx = X - bx - 0.012 * H * np.sin(yaw_s) - 0.045 * H * np.sin(Ys)  # the back of the collar swings away from the turn
+        cy_b = 0.285
+        dcol = np.minimum(0.092 * H * np.cos(yaw_s) - np.abs(cdx), (cy_b - fy) * H)
+        collar = (fy > 0.15) & (dcol > 0) & blouse
+        paint(collar, 0.7 + 0.18 * np.cos(cdx / 9), BLOUSE)
+        trim = collar & (((dcol > 0.010 * H) & (dcol < 0.019 * H)) | ((dcol > 0.029 * H) & (dcol < 0.038 * H)))
+        paint(trim, 0.7, TRIM)
+
+        # ---- arms: swing opposite the same-side leg, elbow bent 30-50 deg, hand trails outward on the backswing ----
+        sleeves = []
+        for side in (-1, 1):
+            u = side * np.cos(fl)
+            ia = pz.near if side < 0 else pz.far                     # intro: near arm swings out, far hand goes to the hip
+            al = ARM_SWING * u                                       # + forward
+            al += ia * ((0.15 if side < 0 else 0.10) - al)
+            back = A * max(0.0, -u)
+            sc = 1 - side * 0.4 * np.sin(yaw_s)                      # foreshortening: far shoulder/sleeve narrows, near one widens
+            sdx = side * SH_HALF * np.cos(yaw_s)
+            sy_off = side * tilt_s * SH_HALF * H * 0.9
+            sx, sy = shx + sdx * H, yy(0.215) + sy_off
+            be = np.radians(4 + 9 * back)
+            fle = np.radians(34 + 12 * A * u)
+            bf = be + np.radians(10 * back + 6 * A * np.sin(fl * 2 + side))  # loose flick
+            be += ia * (np.radians(18 if side < 0 else 35) - be)
+            bf += ia * (np.radians(30 if side < 0 else -10) - bf)
+            h0 = 1 - 0.215
+            ex_, ez_ = side * 0.17 * np.sin(be), 0.17 * np.sin(al)
+            eh = h0 - 0.17 * np.cos(al) * np.cos(be)
+            fa = al + fle
+            wx_, wz_ = ex_ + side * 0.15 * np.sin(bf), ez_ + 0.15 * np.sin(fa)
+            wh = eh - 0.15 * np.cos(fa) * np.cos(bf)
+            cy_, sy_ = np.cos(Ys), np.sin(Ys)                        # turn the arm with the shoulders: sideways -> toward the viewer
+            ex_, ez_, wx_, wz_ = ex_ * cy_ - ez_ * sy_, ez_ * cy_ + ex_ * sy_, wx_ * cy_ - wz_ * sy_, wz_ * cy_ + wx_ * sy_
+            elx, ely = pj(sdx + ex_, ez_, eh, shx, 0.8)
+            wrx, wry = pj(sdx + wx_, wz_, wh, shx, 0.8)
+            ely += sy_off; wry += sy_off
+            d1, h1, s1 = limb(X, Y, (sx, sy), (elx, ely), 0.031 * H * sc, 0.023 * H)
+            d2, h2, s2 = limb(X, Y, (elx, ely), (wrx, wry), 0.023 * H, 0.0155 * H)
+            dd = np.minimum(d1, d2)
+            paint(dd < 0, np.where(d1 < d2, round_lum(s1, 0.5, 0.95), round_lum(s2, 0.5, 0.95)), SKIN, gap=True)
+            hdir = np.array([wrx - elx, wry - ely]) / (np.hypot(wrx - elx, wry - ely) + 1e-6)
+            hand = ellipse(X, Y, wrx + hdir[0] * 0.015 * H, wry + hdir[1] * 0.015 * H, 0.0185 * H, 0.026 * H, np.arctan2(-hdir[0], hdir[1])) < 1
+            paint(hand, 0.9, SKIN)
+            sleeves.append((side, sc, sx, sy))
+        for side, sc, sx, sy in sleeves:  # short puffy sleeves with navy double-stripe hem
+            ex0 = sx + side * 0.012 * H
+            d = ellipse(X, Y, ex0, sy - 0.004 * H, 0.050 * H * sc, 0.040 * H, side * 0.35)
+            bot = sy + 0.04 * H
+            slv = (d < 1) & (Y < bot)
+            paint(slv, 0.9 - 0.25 * np.clip(d, 0, 1) ** 2 - 0.18 * np.clip((Y - sy) / (0.04 * H), 0, 1), BLOUSE, gap=True)
+            paint(slv & (((Y > bot - 0.024 * H) & (Y < bot - 0.016 * H)) | ((Y > bot - 0.011 * H) & (Y < bot - 0.003 * H))), 0.7, TRIM)
+
+
+    def hair():
+        """The long wavy hair: roots follow the head, tips swing late with an S-curve wave and curled ends."""
+        # ---- hair: roots follow the head, tips swing late with a S-curve wave and curled ends ----
+        Xw, Yw_ = bend(X, Y, hrx, top + 0.10 * H, pz.whip, 0.40 * H) if abs(pz.whip) > 1e-3 else (X, Y)  # the whip curls the lock; below, X, Y -> Xw, Yw_
+        f = (Yw_ - top) / H
+        kk = np.clip((f - 0.12) / 0.33, 0, 1)
+        hph = fl - HAIR_LAG
+        sway_h = -HAIR_SWAY * H * np.sin(hph) * kk ** 1.4
+        wave = H * (0.006 + 0.022 * kk ** 1.3) * np.sin(2 * np.pi * f / 0.30 - hph) \
+            + 0.013 * H * smooth((f - 0.33) / 0.08) * np.sin(2 * np.pi * (f - 0.33) / 0.10 - hph * 2)
+        hcx = hrx + sway_h + wave
+        hwh = H * np.where(f < 0.075, 0.066 * np.sqrt(np.clip(1 - ((0.075 - f) / 0.075) ** 2, 0, 1)),
+                           0.060 + 0.034 * smooth((f - 0.13) / 0.30))
+        hwh = hwh * (1 + 0.05 * np.sin(f * 40 + hph) * kk + 0.10 * smooth((f - 0.37) / 0.06) + (0.45 * min(abs(pz.whip), 1.1) + 0.35 * pz.fan) * kk ** 1.3) * (1.15 if front else 1)  # a whipped lock fans out; from the front more of it shows beside her
+        uh = (Xw - hcx) / np.maximum(hwh, 1)
+        tri = np.abs((uh * 1.6 + 1) % 1 * 2 - 1)
+        tips = top + H * (0.435 + 0.035 * (1 - tri) - 0.012 * uh ** 2 + 0.010 * np.cos(2 * hph) + 0.004 * np.sin(uh * 23 + hph) + 0.03 * pz.bounce * kk)
+        hair = (np.abs(uh) < 1) & (f > 0) & (Yw_ < tips)
+        sfield = uh * 34 + 3 * np.sin(2 * np.pi * f / 0.30 - hph + uh)
+        strands = 0.5 + 0.5 * np.sin(sfield)
+        fine = 0.5 + 0.5 * np.sin(uh * 97 + f * 14)
+        ring = np.exp(-((f - (0.062 + 0.02 * uh ** 2)) / 0.02) ** 2) + 0.4 * np.exp(-((f - (0.27 + 0.03 * uh ** 2 + 0.01 * np.sin(hph))) / 0.025) ** 2)
+        lum = (0.28 + 0.3 * strands + 0.14 * fine) * (0.7 + 0.3 * (1 - uh ** 2)) + 0.4 * ring
+        lum = lum * np.clip((tips - Yw_) / 18, 0.25, 1)
+        paint(hair, lum, np.where(ring > 0.35, HAIR_S, HAIR), gap=True)
+        gy, gx = np.gradient(sfield)
+        phi2 = 2 * np.arctan2(-gy, gx)
+        hair_aux[0][hair], hair_aux[1][hair], hair_aux[2][hair] = np.cos(phi2)[hair], np.sin(phi2)[hair], np.clip(ring, 0, 1)[hair]
+
+
+    def ribbons():
+        """The two ribbon tails: they hang from the bow, trail the motion with a big lag and flutter."""
+        # ---- ribbon tails: hang from the bow, trail the motion with a big lag, sway widely and flutter ----
+        for side in (-1, 1):
+            ph = fl - TAIL_LAG - side * 0.5
+            sv = (Y - bowy) / (0.50 * H)
+            xc = bowx + side * 0.016 * H * sv - TAIL_SWAY * H * np.sin(ph) * np.clip(sv, 0, 1) ** 1.3 + pz.tail_x * H * np.clip(sv, 0, 1) ** 1.3 \
+                + 0.010 * H * np.clip(sv, 0, 1) * np.sin(3 * fl - 5 * sv + side)
+            w = 0.017 * H * (0.55 + 0.45 * np.abs(np.cos(sv * 8 - 2 * fl + side)))
+            dn = (X - xc) / w
+            end = 1 - 0.07 * (1 - np.abs(dn))
+            rib = (np.abs(dn) < 1) & (sv > 0.02) & (sv < end)
+            lm = 0.72 + 0.25 * np.sin(sv * 16 - 2 * fl * 1 + side) - 0.15 * np.abs(dn)
+            paint(rib, np.clip(lm, 0.3, 1), np.where(lm < 0.62, BOW_S, BOW), gap=True)
+
+    def bow():
+        """The big bow on the back of the head."""
+        # ---- big bow on the back of the head ----
+        wob = 0.08 * A * np.sin(2 * fl)
+        cd = abs(np.cos(Yd))                                         # the bow turns edge-on with the head
+        for side in (-1, 1):
+            d = ellipse(X, Y, bowx + side * 0.066 * H * cd, bowy, 0.064 * H * (0.4 + 0.6 * cd), 0.037 * H, -side * (0.35 + wob))
+            hole = ellipse(X, Y, bowx + side * 0.070 * H * cd, bowy, 0.032 * H * (0.4 + 0.6 * cd), 0.014 * H, -side * (0.35 + wob)) < 1
+            lm = 0.6 + 0.4 * np.clip(d, 0, 1)
+            paint(d < 1, np.where(hole, 0.45, lm), np.where(hole | (d > 0.6), BOW_S, BOW), gap=True)
+        paint(ellipse(X, Y, bowx, bowy, 0.018 * H, 0.020 * H) < 1, 0.95, BOW, gap=True)
+
+
+    def front_upper():
+        """Facing us: blouse with the sailor V and the lilac neckerchief, neck, head with the face, bangs, arms, puff sleeves, side locks."""
+        c_s, s_s = np.cos(psi_s), np.sin(psi_s)
+        # ---- blouse and collar ----
+        Yw = Y - tilt_s * (X - bx) * smooth(wv * 1.1)    # inverse shoulder tilt
+        fy = (Yw - top) / H
+        half = interp_s(fy, [0.135, 0.16, Y_SH, 0.24, 0.31, Y_WAIST, 0.415], [0.040, 0.082, SH_HALF, 0.088, 0.073, 0.066, 0.068]) * H * TW
+        blouse = (np.abs(X - bx) < half) & (fy > 0.135) & (fy < 0.415)
+        ring = dilate(blouse, 3, 3) & ~blouse & np.isin(P, (HAIR, HAIR_S, BOW, BOW_S))  # a void line keeps the blouse apart from the hair behind it
+        L[ring], P[ring] = 0, SKY
+        dxn = (X - bx) / np.maximum(half, 1)
+        paint(blouse, 0.82 + 0.15 * (1 - dxn ** 2) - 0.2 * smooth((np.abs(dxn) - 0.8) / 0.2), BLOUSE)
+        dx = np.abs(X - bx) / H / max(abs(c_s), 0.2)       # across the chest, foreshortened with the turn
+        xi = 0.03 * (0.225 - fy) / 0.075                    # inner V (the neckline) ...
+        xo = 0.092 * (0.31 - fy) / 0.16                    # ... and outer V edge of the sailor collar
+        neckline = blouse & (fy > 0.14) & (dx < xi)
+        paint(neckline, 0.85 - 0.15 * np.clip((fy - 0.14) / 0.09, 0, 1), SKIN)
+        collar = blouse & (fy > 0.15) & (fy < 0.31) & (dx < xo) & (dx > np.maximum(xi, 0))
+        paint(collar, 0.7 + 0.2 * np.clip(1 - np.abs(xo - dx) / 0.05, 0, 1), BLOUSE)
+        de = xo - dx
+        trim = collar & (((de > 0.008) & (de < 0.014)) | ((de > 0.021) & (de < 0.027)))
+        paint(trim, 0.7, TRIM)
+        # lilac neckerchief tied at the chest: two loops, a knot and two short tails
+        nx, ny = shx, yy(0.283)
+        for side in (-1, 1):
+            tail = capsule(X, Y, nx + side * 0.006 * H, ny, nx + side * 0.024 * H * (1 + 0.5 * pz.fan), ny + 0.07 * H, 0.0105 * H)
+            paint(tail, 0.78, BOW, gap=True)
+        for side in (-1, 1):
+            d = ellipse(X, Y, nx + side * 0.030 * H * abs(c_s), ny, 0.032 * H * (0.4 + 0.6 * abs(c_s)), 0.0165 * H, -side * 0.30)
+            hole = ellipse(X, Y, nx + side * 0.032 * H * abs(c_s), ny, 0.015 * H * (0.4 + 0.6 * abs(c_s)), 0.007 * H, -side * 0.30) < 1
+            paint(d < 1, np.where(hole, 0.5, 0.6 + 0.4 * np.clip(d, 0, 1)), np.where(hole | (d > 0.6), BOW_S, BOW), gap=True)
+        paint(ellipse(X, Y, nx, ny, 0.0145 * H, 0.0155 * H) < 1, 0.95, BOW, gap=True)
+
+        # ---- neck and head (head-local coordinates u, v in H, v = 0 at the head centre; the crown is at v = -0.07) ----
+        hcx, hcy = hdx, top + 0.07 * H
+        tc, ts = np.cos(pz.htilt), np.sin(pz.htilt)
+        U, V = ((X - hcx) * tc + (Y - hcy) * ts) / H, (-(X - hcx) * ts + (Y - hcy) * tc) / H
+        cd_, sd_ = np.cos(psi_d), np.sin(psi_d)
+        neck = (np.abs(X - (hcx * 0.4 + bx * 0.6)) < 0.017 * H) & (Y > hcy) & (Y < yy(0.19))
+        paint(neck, 0.7, SKIN)
+        rxv = 0.052 * (1 - 0.22 * np.clip(V / 0.067, 0, 1) ** 2)
+        head = (U / rxv) ** 2 + (V / 0.067) ** 2 < 1
+        face_side = np.where(sd_ >= 0, U < 0.052 * cd_, U > -0.052 * cd_)  # the hairline slides across the head as it turns away
+        cap = head & ~face_side
+        paint(cap, 0.45 + 0.25 * (0.5 + 0.5 * np.sin(U * 300)), HAIR)
+        skin = head & face_side
+        paint(skin, 0.92 - 0.25 * np.clip((V + 0.01) / 0.07, 0, 1) ** 2 - 0.12 * (U / 0.052) ** 2 - 0.06 * U / 0.052, SKIN)
+        if abs(sd_) > 0.55:  # profile: a nose and chin hint on the silhouette
+            sg = -np.sign(sd_)
+            paint(ellipse(U, V, sg * 0.054, 0.016, 0.009, 0.010) < 1, 0.85, SKIN)
+            paint(ellipse(U, V, sg * 0.030, 0.062, 0.016, 0.009) < 1, 0.7, SKIN)
+        # face: two big dark eyes with a highlight, blush, a small smile; it foreshortens and slides with the turn
+        w = max(cd_, 0.25)
+        fx = lambda u0: u0 * cd_ - 0.05 * sd_
+        for sg in (-1, 1):
+            Uc, Ve = fx(sg * 0.027), 0.012
+            e = ((U - Uc) / (0.0140 * w)) ** 2 + ((V - Ve) / 0.0200) ** 2
+            if pz.blink:
+                arc = np.abs(V - (Ve + 0.008 - 0.007 * ((U - Uc) / (0.0125 * w)) ** 2)) < 0.0035
+                eye = arc & (np.abs(U - Uc) < 0.0135 * w)
+                paint(eye & skin, 0.3, PUPIL)
+            else:
+                eye = (e < 1) & skin
+                paint(eye, 0.3 + 0.5 * np.clip((V - Ve) / 0.0185 + 0.2, 0, 1) ** 1.5, PUPIL)
+                paint(eye & (V - Ve < -0.010), 0.2, PUPIL)  # darker upper lid
+                paint((ellipse(U, V, Uc + 0.005 * w, Ve - 0.0065, 0.0058 * w, 0.0058) < 1) & eye, 1.0, BLOUSE)
+            paint((ellipse(U, V, fx(sg * 0.041), 0.042, 0.0150 * w, 0.0085) < 1) & skin, 0.85, BLUSH)
+        mth = (np.abs(U - fx(0)) < 0.0125 * w) & (np.abs(V - (0.054 - 0.008 * ((U - fx(0)) / (0.0125 * w)) ** 2)) < 0.0034)
+        paint(mth & skin, 0.8, LIP)
+        # bangs across the forehead, parted at the centre, with a sheen ring; strands slant outward and down
+        ub = (U + 0.05 * sd_) / max(cd_, 0.35)
+        vt = V + 0.07
+        vb = 0.049 + 0.021 * (np.abs(ub) / 0.052) ** 1.5 + 0.0035 * np.sin(ub * 350)
+        bangs = (((U / (rxv + 0.004)) ** 2 + (V / 0.071) ** 2) < 1) & (vt < vb) & (face_side | (np.abs(U) < 0.004))
+        sf = (ub + 0.25 * np.sign(ub) * vt) * 62
+        ring_b = np.exp(-(((vt - 0.024 - 0.012 * (ub / 0.05) ** 2)) / 0.011) ** 2)
+        lum_b = (0.3 + 0.3 * (0.5 + 0.5 * np.sin(sf)) + 0.12 * (0.5 + 0.5 * np.sin(ub * 190 + 3 * vt))) * (0.8 + 0.2 * (1 - (ub / 0.06) ** 2)) + 0.4 * ring_b
+        paint(bangs, lum_b, np.where(ring_b > 0.35, HAIR_S, HAIR))
+        gy, gx = np.gradient(sf)
+        phi2 = 2 * np.arctan2(-gy, gx)
+        hair_aux[0][bangs], hair_aux[1][bangs], hair_aux[2][bangs] = np.cos(phi2)[bangs], np.sin(phi2)[bangs], np.clip(ring_b, 0, 1)[bangs]
+
+        # ---- arms: two-bone reach from the shoulder to the hand; the hands rest at the bow, tuck in, fling out in the spin, or one waves ----
+        LU, LF = 0.17 * H, 0.15 * H
+        sleeves = []
+        for side in (-1, 1):                                  # side +1 = screen-right = her left; it is the near side when the face swings to screen-left
+            sc = 1 + side * 0.4 * s_s
+            sx, sy_off = shx + side * SH_HALF * abs(c_s) * H, side * tilt_s * SH_HALF * H * 0.9
+            sx, sy = sx, yy(0.215) + sy_off
+            fid = 2 * np.pi * 17 * pz.t / NF + 1.3 * side      # the fidget: four frames per cycle, periodic over the loop
+            hold = (1 - pz.tuck) * (1 - 0.8 * (pz.near if side > 0 else pz.far))
+            hand = np.array([shx + side * 0.020 * H + hold * 0.006 * H * np.cos(fid), yy(0.300) + hold * 0.005 * H * np.sin(2 * fid)])
+            tuck = np.array([shx + side * 0.008 * H, yy(0.310)])
+            out = np.array([shx + side * 0.26 * H * abs(c_s), yy(0.42)])
+            arms_out = pz.near if side > 0 else pz.far
+            T = hand + pz.tuck * (tuck - hand)
+            T = T + arms_out * (out - T)
+            wave = pz.wave if side < 0 else 0.0
+            T = T + wave * (np.array([shx - 0.2 * H + 0.035 * H * np.sin(pz.wph), yy(0.115 - 0.012 * np.cos(pz.wph))]) - T)
+            S = np.array([sx, sy])
+            d = np.hypot(*(T - S))
+            d = np.clip(d, 0.06 * H, 0.97 * (LU + LF))
+            dv = (T - S) / (np.hypot(*(T - S)) + 1e-6)
+            a_ = (LU ** 2 - LF ** 2 + d ** 2) / (2 * d)
+            perp = np.array([-dv[1], dv[0]])
+            pole = np.array([side * (0.5 + 1.0 * wave + 0.8 * arms_out), 1.0])
+            if perp @ pole < 0:
+                perp = -perp
+            E = S + a_ * dv + np.sqrt(max(LU ** 2 - a_ ** 2, 0)) * perp
+            Wr = S + d * dv
+            d1, h1, s1 = limb(X, Y, S, E, 0.031 * H * sc, 0.023 * H)
+            d2, h2, s2 = limb(X, Y, E, Wr, 0.023 * H, 0.0155 * H)
+            paint(np.minimum(d1, d2) < 0, np.where(d1 < d2, round_lum(s1, 0.5, 0.95), round_lum(s2, 0.5, 0.95)), SKIN, gap=True)
+            hdir = (Wr - E) / (np.hypot(*(Wr - E)) + 1e-6)
+            big = 1 + 0.25 * wave
+            paint(ellipse(X, Y, Wr[0] + hdir[0] * 0.015 * H, Wr[1] + hdir[1] * 0.015 * H, 0.0185 * H * big, 0.026 * H * big, np.arctan2(-hdir[0], hdir[1])) < 1, 0.9, SKIN)
+            sleeves.append((side, sc, sx, sy))
+        for side, sc, sx, sy in sleeves:  # short puffy sleeves with navy double-stripe hem
+            ex0 = sx + side * 0.012 * H
+            d = ellipse(X, Y, ex0, sy - 0.004 * H, 0.050 * H * sc, 0.040 * H, side * 0.35)
+            bot = sy + 0.04 * H
+            slv = (d < 1) & (Y < bot)
+            paint(slv, 0.9 - 0.25 * np.clip(d, 0, 1) ** 2 - 0.18 * np.clip((Y - sy) / (0.04 * H), 0, 1), BLOUSE, gap=True)
+            paint(slv & (((Y > bot - 0.024 * H) & (Y < bot - 0.016 * H)) | ((Y > bot - 0.011 * H) & (Y < bot - 0.003 * H))), 0.7, TRIM)
+        # ---- side locks framing the face, down past the shoulders; they swing with the hair springs ----
+        vl = (Y - top) / H
+        for side in (-1, 1):
+            xc = hcx + H * (side * 0.057 * cd_ - 0.05 * sd_ + 0.008 * np.sin(vl * 26 + side)) - pz.whip * 0.07 * H * smooth((vl - 0.08) / 0.25) ** 1.3 \
+                + 0.07 * H * np.sin(pz.htilt) * smooth((vl - 0.1) / 0.2)
+            wl = H * (0.0105 + 0.002 * np.sin(vl * 50)) * (0.6 + 0.4 * max(cd_, 0.3)) * smooth((vl - 0.04) / 0.04) * (1 - 0.7 * smooth((vl - 0.22) / 0.11) ** 1.5)
+            lock = (np.abs(X - xc) < wl) & (vl > 0.04) & (vl < 0.325 + 0.01 * side)
+            ul = (X - xc) / np.maximum(wl, 1)
+            lum_l = (0.3 + 0.35 * (0.5 + 0.5 * np.sin(ul * 6 + vl * 30))) * (0.75 + 0.25 * (1 - ul ** 2)) + 0.3 * np.exp(-((vl - 0.12) / 0.03) ** 2)
+            paint(lock, lum_l, np.where(lum_l > 0.62, HAIR_S, HAIR))
+            gy, gx = np.gradient(ul * 4 + vl * 70 * 0.2)
+            phi2 = 2 * np.arctan2(-gy, gx)
+            hair_aux[0][lock], hair_aux[1][lock], hair_aux[2][lock] = np.cos(phi2)[lock], np.sin(phi2)[lock], (lum_l > 0.62)[lock] * 0.0
+
+    if front:  # hair, ribbons and bow sit behind her
+        hair(); ribbons(); bow()
 
     # ---- legs ----
     for side in (-1, 1):
@@ -317,8 +659,8 @@ def girl(X, Y, pz, L, P, hair_aux):
         hyy += side * tilt_h * HIP_SEP * H
         kh, kz = hip_h - LT * np.cos(th), LT * np.sin(th)
         ah, az = kh - LS * np.cos(th - flex), kz + LS * np.sin(th - flex)
-        kx, ky = pj((side * (HIP_SEP + FOOT_SEP) / 2 + side * 0.004 * flex) * cos_h, kz, kh, cx + hipx)
-        ax, ay = pj(side * FOOT_SEP * cos_h, az, ah, cx + hipx)
+        kx, ky = pj((side * (HIP_SEP + FOOT_SEP) / 2 + side * 0.004 * flex) * cos_h, kz, kh, cx + walk_x + 0.5 * jx)
+        ax, ay = pj(side * FOOT_SEP * cos_h, az, ah, cx + walk_x)
         fwd = np.clip(az / 0.15, 0, 1)
         d1, h1, s1 = limb(X, Y, (hx, hyy), (kx, ky), 0.036 * H, 0.025 * H)
         d2, h2, s2 = limb(X, Y, (kx, ky), (ax, ay), 0.024 * H, 0.0145 * H, bulge=0.005 * H)
@@ -358,115 +700,10 @@ def girl(X, Y, pz, L, P, hair_aux):
     stripe = (np.abs(u) < 1) & (np.abs(Y - (hem - 0.03 * H)) < 2.6) & skirt
     paint(stripe, 0.85, RUFFLE)
 
-    # ---- blouse: shoulders -> waist, shoulder line tilts and counter-rotates against the hips ----
-    Yw = Y - tilt_s * (X - bx) * smooth(wv * 1.1)   # inverse shoulder tilt
-    fy = (Yw - top) / H
-    half = interp_s(fy, [0.135, 0.16, Y_SH, 0.24, 0.31, Y_WAIST, 0.415], [0.040, 0.082, SH_HALF * np.cos(yaw_w), 0.088, 0.073, 0.066, 0.068]) * H * TW
-    blouse = (np.abs(X - bx) < half) & (fy > 0.135) & (fy < 0.415)
-    dxn = (X - bx) / np.maximum(half, 1)
-    paint(blouse, 0.82 + 0.15 * (1 - dxn ** 2) - 0.2 * smooth((np.abs(dxn) - 0.8) / 0.2), BLOUSE)
-    # square sailor collar on the back with a navy double stripe; its centre shifts with the shoulder yaw
-    cdx = X - bx - 0.012 * H * np.sin(yaw_s) - 0.045 * H * np.sin(Ys)  # the back of the collar swings away from the turn
-    cy_b = 0.285
-    dcol = np.minimum(0.092 * H * np.cos(yaw_s) - np.abs(cdx), (cy_b - fy) * H)
-    collar = (fy > 0.15) & (dcol > 0) & blouse
-    paint(collar, 0.7 + 0.18 * np.cos(cdx / 9), BLOUSE)
-    trim = collar & (((dcol > 0.010 * H) & (dcol < 0.019 * H)) | ((dcol > 0.029 * H) & (dcol < 0.038 * H)))
-    paint(trim, 0.7, TRIM)
-
-    # ---- arms: swing opposite the same-side leg, elbow bent 30-50 deg, hand trails outward on the backswing ----
-    sleeves = []
-    for side in (-1, 1):
-        u = side * np.cos(fl)
-        ia = pz.near if side < 0 else pz.far                     # intro: near arm swings out, far hand goes to the hip
-        al = ARM_SWING * u                                       # + forward
-        al += ia * ((0.15 if side < 0 else 0.10) - al)
-        back = A * max(0.0, -u)
-        sc = 1 - side * 0.4 * np.sin(yaw_s)                      # foreshortening: far shoulder/sleeve narrows, near one widens
-        sdx = side * SH_HALF * np.cos(yaw_s)
-        sy_off = side * tilt_s * SH_HALF * H * 0.9
-        sx, sy = shx + sdx * H, yy(0.215) + sy_off
-        be = np.radians(4 + 9 * back)
-        fle = np.radians(34 + 12 * A * u)
-        bf = be + np.radians(10 * back + 6 * A * np.sin(fl * 2 + side))  # loose flick
-        be += ia * (np.radians(18 if side < 0 else 35) - be)
-        bf += ia * (np.radians(30 if side < 0 else -10) - bf)
-        h0 = 1 - 0.215
-        ex_, ez_ = side * 0.17 * np.sin(be), 0.17 * np.sin(al)
-        eh = h0 - 0.17 * np.cos(al) * np.cos(be)
-        fa = al + fle
-        wx_, wz_ = ex_ + side * 0.15 * np.sin(bf), ez_ + 0.15 * np.sin(fa)
-        wh = eh - 0.15 * np.cos(fa) * np.cos(bf)
-        cy_, sy_ = np.cos(Ys), np.sin(Ys)                        # turn the arm with the shoulders: sideways -> toward the viewer
-        ex_, ez_, wx_, wz_ = ex_ * cy_ - ez_ * sy_, ez_ * cy_ + ex_ * sy_, wx_ * cy_ - wz_ * sy_, wz_ * cy_ + wx_ * sy_
-        elx, ely = pj(sdx + ex_, ez_, eh, shx, 0.8)
-        wrx, wry = pj(sdx + wx_, wz_, wh, shx, 0.8)
-        ely += sy_off; wry += sy_off
-        d1, h1, s1 = limb(X, Y, (sx, sy), (elx, ely), 0.031 * H * sc, 0.023 * H)
-        d2, h2, s2 = limb(X, Y, (elx, ely), (wrx, wry), 0.023 * H, 0.0155 * H)
-        dd = np.minimum(d1, d2)
-        paint(dd < 0, np.where(d1 < d2, round_lum(s1, 0.5, 0.95), round_lum(s2, 0.5, 0.95)), SKIN, gap=True)
-        hdir = np.array([wrx - elx, wry - ely]) / (np.hypot(wrx - elx, wry - ely) + 1e-6)
-        hand = ellipse(X, Y, wrx + hdir[0] * 0.015 * H, wry + hdir[1] * 0.015 * H, 0.0185 * H, 0.026 * H, np.arctan2(-hdir[0], hdir[1])) < 1
-        paint(hand, 0.9, SKIN)
-        sleeves.append((side, sc, sx, sy))
-    for side, sc, sx, sy in sleeves:  # short puffy sleeves with navy double-stripe hem
-        ex0 = sx + side * 0.012 * H
-        d = ellipse(X, Y, ex0, sy - 0.004 * H, 0.050 * H * sc, 0.040 * H, side * 0.35)
-        bot = sy + 0.04 * H
-        slv = (d < 1) & (Y < bot)
-        paint(slv, 0.9 - 0.25 * np.clip(d, 0, 1) ** 2 - 0.18 * np.clip((Y - sy) / (0.04 * H), 0, 1), BLOUSE, gap=True)
-        paint(slv & (((Y > bot - 0.024 * H) & (Y < bot - 0.016 * H)) | ((Y > bot - 0.011 * H) & (Y < bot - 0.003 * H))), 0.7, TRIM)
-
-    # ---- hair: roots follow the head, tips swing late with a S-curve wave and curled ends ----
-    Xw, Yw_ = bend(X, Y, hrx, top + 0.10 * H, pz.whip, 0.40 * H) if abs(pz.whip) > 1e-3 else (X, Y)  # the whip curls the lock; below, X, Y -> Xw, Yw_
-    f = (Yw_ - top) / H
-    kk = np.clip((f - 0.12) / 0.33, 0, 1)
-    hph = fl - HAIR_LAG
-    sway_h = -HAIR_SWAY * H * np.sin(hph) * kk ** 1.4
-    wave = H * (0.006 + 0.022 * kk ** 1.3) * np.sin(2 * np.pi * f / 0.30 - hph) \
-        + 0.013 * H * smooth((f - 0.33) / 0.08) * np.sin(2 * np.pi * (f - 0.33) / 0.10 - hph * 2)
-    hcx = hrx + sway_h + wave
-    hwh = H * np.where(f < 0.075, 0.066 * np.sqrt(np.clip(1 - ((0.075 - f) / 0.075) ** 2, 0, 1)),
-                       0.060 + 0.034 * smooth((f - 0.13) / 0.30))
-    hwh = hwh * (1 + 0.05 * np.sin(f * 40 + hph) * kk + 0.10 * smooth((f - 0.37) / 0.06) + 0.45 * min(abs(pz.whip), 1.1) * kk ** 1.3)  # a whipped lock fans out
-    uh = (Xw - hcx) / np.maximum(hwh, 1)
-    tri = np.abs((uh * 1.6 + 1) % 1 * 2 - 1)
-    tips = top + H * (0.435 + 0.035 * (1 - tri) - 0.012 * uh ** 2 + 0.010 * np.cos(2 * hph) + 0.004 * np.sin(uh * 23 + hph))
-    hair = (np.abs(uh) < 1) & (f > 0) & (Yw_ < tips)
-    sfield = uh * 34 + 3 * np.sin(2 * np.pi * f / 0.30 - hph + uh)
-    strands = 0.5 + 0.5 * np.sin(sfield)
-    fine = 0.5 + 0.5 * np.sin(uh * 97 + f * 14)
-    ring = np.exp(-((f - (0.062 + 0.02 * uh ** 2)) / 0.02) ** 2) + 0.4 * np.exp(-((f - (0.27 + 0.03 * uh ** 2 + 0.01 * np.sin(hph))) / 0.025) ** 2)
-    lum = (0.28 + 0.3 * strands + 0.14 * fine) * (0.7 + 0.3 * (1 - uh ** 2)) + 0.4 * ring
-    lum = lum * np.clip((tips - Yw_) / 18, 0.25, 1)
-    paint(hair, lum, np.where(ring > 0.35, HAIR_S, HAIR), gap=True)
-    gy, gx = np.gradient(sfield)
-    phi2 = 2 * np.arctan2(-gy, gx)
-    hair_aux[0][hair], hair_aux[1][hair], hair_aux[2][hair] = np.cos(phi2)[hair], np.sin(phi2)[hair], np.clip(ring, 0, 1)[hair]
-
-    # ---- ribbon tails: hang from the bow, trail the motion with a big lag, sway widely and flutter ----
-    bowx, bowy = hrx + 0.028 * H, yy(0.05)
-    for side in (-1, 1):
-        ph = fl - TAIL_LAG - side * 0.5
-        sv = (Y - bowy) / (0.50 * H)
-        xc = bowx + side * 0.016 * H * sv - TAIL_SWAY * H * np.sin(ph) * np.clip(sv, 0, 1) ** 1.3 + pz.tail_x * H * np.clip(sv, 0, 1) ** 1.3 \
-            + 0.010 * H * np.clip(sv, 0, 1) * np.sin(3 * fl - 5 * sv + side)
-        w = 0.017 * H * (0.55 + 0.45 * np.abs(np.cos(sv * 8 - 2 * fl + side)))
-        dn = (X - xc) / w
-        end = 1 - 0.07 * (1 - np.abs(dn))
-        rib = (np.abs(dn) < 1) & (sv > 0.02) & (sv < end)
-        lm = 0.72 + 0.25 * np.sin(sv * 16 - 2 * fl * 1 + side) - 0.15 * np.abs(dn)
-        paint(rib, np.clip(lm, 0.3, 1), np.where(lm < 0.62, BOW_S, BOW), gap=True)
-    # ---- big bow on the back of the head ----
-    wob = 0.08 * A * np.sin(2 * fl)
-    cd = np.cos(Yd)                                         # the bow turns edge-on with the head
-    for side in (-1, 1):
-        d = ellipse(X, Y, bowx + side * 0.066 * H * cd, bowy, 0.064 * H * (0.4 + 0.6 * cd), 0.037 * H, -side * (0.35 + wob))
-        hole = ellipse(X, Y, bowx + side * 0.070 * H * cd, bowy, 0.032 * H * (0.4 + 0.6 * cd), 0.014 * H, -side * (0.35 + wob)) < 1
-        lm = 0.6 + 0.4 * np.clip(d, 0, 1)
-        paint(d < 1, np.where(hole, 0.45, lm), np.where(hole | (d > 0.6), BOW_S, BOW), gap=True)
-    paint(ellipse(X, Y, bowx, bowy, 0.018 * H, 0.020 * H) < 1, 0.95, BOW, gap=True)
+    if front:
+        front_upper()
+    else:
+        back_upper(); hair(); ribbons(); bow()
 
 def shade_rgb(P, L, T, X, Y):
     """Part base colour x luminance, with a slow tonal drift inside each part and cool shadows / warm lights.
@@ -532,17 +769,25 @@ def render(f):
     d.text((W / 2, H + 11), "♪ now playing: cry — aisin-gioro & toyoki", font=cap, fill=(185, 163, 196), anchor="mm")
     return img
 
-if __name__ == "__main__":
-    # the frame after the last must flow into frame 0: same rest pose, and the road wrapped by a whole number of lamp spacings
+def check_loop():
+    """The frame after the last must flow into frame 0: the same pose (yaw compared as an angle), springs at rest, gait phase back
+    on the beat, the road wrapped by a whole number of lamp spacings, and identical characters."""
     a, b = pose_at(0), pose_at(NF)
-    assert np.allclose([a.amp, a.yaw_hip, a.yaw_sh, a.yaw_head, a.dip, a.near, a.far, a.whip, a.tail_x, a.flare, a.hem_x],
-                       [b.amp, b.yaw_hip, b.yaw_sh, b.yaw_head, b.dip, b.near, b.far, b.whip, b.tail_x, b.flare, b.hem_x], atol=1e-3), "rest pose must return"
+    fields = ("amp", "squat", "tuck", "near", "far", "sway", "shim", "htilt", "wave", "blink", "bob", "fan", "whip", "tail_x", "flare", "hem_x", "bounce")
+    assert np.allclose([getattr(a, k) for k in fields], [getattr(b, k) for k in fields], atol=1e-3), "rest pose must return"
+    assert abs(a.wph - b.wph) < 1e-6 and abs(a.t % NF - b.t % NF) < 1e-6, "jig phase and fidget clock must return"
+    for k in ("yaw_hip", "yaw_sh", "yaw_head"):
+        assert abs(np.sin(getattr(a, k) - getattr(b, k))) < 1e-6 and np.cos(getattr(a, k) - getattr(b, k)) > 0, f"{k} must come back round to the front"
+    assert (SPRING[0] == 0).all() and (SPRING[NF] == 0).all(), "springs must be at rest at the loop point"
     assert abs((b.fl - a.fl + np.pi) % (2 * np.pi) - np.pi) < 1e-6, "gait phase must return"
     assert abs((b.travel - a.travel + STEP_M * STRIDES / 2) % (STEP_M * STRIDES) - STEP_M * STRIDES / 2) < 1e-6, "road must wrap"
     assert (frame(0)[0] == frame(NF)[0]).all(), "loop must wrap cleanly"
+
+if __name__ == "__main__":
+    check_loop()
     frames = [render(f) for f in range(NF)]
     sheet = Image.new("RGB", (frames[0].width * 2, frames[0].height * 2))  # one palette sampled from four frames
-    for i, k in enumerate((0, 5, 20, 40)):
+    for i, k in enumerate((0, 14, 27, 44)):
         sheet.paste(frames[k], (i % 2 * frames[0].width, i // 2 * frames[0].height))
     pal = sheet.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
     frames = [fr.quantize(palette=pal, dither=Image.Dither.NONE) for fr in frames]
