@@ -103,7 +103,7 @@ def dilate(m, rx, ry):
     return out
 
 def girl(X, Y, t, L, P, hair_aux):
-    """t: phase within one stride (0..1). Painted back to front: legs, skirt, bodice, arms, waist bow, hair, head bow.
+    """t: phase within one stride (0..1). Painted back to front: legs, petticoat, skirt, bodice, waist bow, arms, hair, bows.
     Phase is offset so frame 0 is a full stride (not the passing pose) and f0/f6 are mirror strides."""
     p = 2 * np.pi * t + np.pi / 2
     cx, sway, bob = W * 0.54 + 5 * np.sin(p), 5 * np.sin(p), -4 * (1 - np.cos(2 * p)) / 2
@@ -117,70 +117,79 @@ def girl(X, Y, t, L, P, hair_aux):
         P[mask] = part
 
     L[ellipse(X, Y, cx, G + 2, 70, 9) < 1] *= 0.45  # contact shadow
-    # legs: forward foot is further away so it sits higher and smaller; the trailing heel lifts, sole showing
+    wy, hy = 292 + bob, 420 + bob
+    # legs: hip -> knee -> ankle. The forward foot is further away, so it sits ~5 rows higher and smaller;
+    # the trailing foot keeps its toe down while the heel lifts, showing the sole.
     for side, ph in ((-1, p), (1, p + np.pi)):
         fwd = max(0.0, np.sin(ph))
-        ax = cx + side * 17 - sway * 0.4
-        ankle_y = G - 10 - 26 * fwd
-        lift = 20 * max(0.0, -np.sin(ph + 0.6))
-        end_y = ankle_y - lift
-        paint(capsule(X, Y, ax, 430, ax + side * 2, end_y, 6), 0.8, SKIN)
-        paint(capsule(X, Y, ax, 515, ax + side * 2, end_y, 6.5), 0.95 - 0.12 * (np.abs(X - ax) / 7), SOCK)
-        shoe = ellipse(X, Y, ax + side * 2, end_y + 5, 9 - 2 * fwd, 6 - 1.5 * fwd) < 1
-        paint(shoe, 0.3 + 0.25 * np.clip((end_y - Y) / 8 + 1, 0, 1), SHOE)
-        if lift > 4:
-            paint(shoe & (Y > end_y + 5), 0.85, SHOE)
+        trail = max(0.0, -np.sin(ph + 0.5))
+        hx, hip_y = cx + side * 17 - sway * 0.4, hy - 10
+        ax, ay = hx + side * 2 - side * 6 * fwd, G - 10 - 50 * fwd - 30 * trail
+        kx, ky = (hx + ax) / 2 + side * 14 * (fwd + trail), (hip_y + ay) / 2
+        r = 7 - 2 * fwd
+        paint(capsule(X, Y, hx, hip_y, kx, ky, 7.5) | capsule(X, Y, kx, ky, ax, ay, r), 0.8, SKIN)
+        sx0, sy0 = kx + (ax - kx) * 0.35, ky + (ay - ky) * 0.35
+        paint(capsule(X, Y, sx0, sy0, ax, ay, r + 0.5), 0.95 - 0.12 * (np.abs(X - ax) / 7), SOCK)  # sock/skin split
+        top, bot = ay + 3, ay + 11 + 30 * trail
+        shoe = ellipse(X, Y, ax, (top + bot) / 2, 10 - 3.5 * fwd, (bot - top) / 2) < 1
+        paint(shoe, 0.3 + 0.25 * np.clip((ay - Y) / 8 + 1, 0, 1), SHOE)
+        if trail > 0.15:  # sole faces the viewer: a light band
+            paint(ellipse(X, Y, ax, (top + bot) / 2 + 1, 7, (bot - top) / 2 - 2) < 1, 0.9, LACE)
 
-    # skirt: flares from a nipped waist, scalloped lace hem, two ruffle tiers shown as light bands
-    wy, hy = 300 + bob, 430 + bob
+    # skirt: flares from a nipped waist into a bell, scalloped lace hem, two ruffle tiers; hip drops toward the planted leg
     v = np.clip((Y - wy) / (hy - wy), 0, 1)
     scx = cx + sway * 1.6 * v ** 1.5 - 4 * np.sin(p - 0.8) * v
-    hw = 30 + 80 * v ** 0.8
+    hw = 34 + 96 * v ** 0.6 + 14 * np.sin(np.pi * v)
     u = (X - scx) / hw
-    hem = hy + 7 * np.abs(np.sin((X - scx) / 11))
+    hem = hy + 7 * np.abs(np.sin((X - scx) / 11)) + 5 * np.sin(p) * np.clip(u, -1, 1)
+    # petticoat lace peeks out below the hem with its own, finer scallops
+    pet = (np.abs(u) < 1.04) & (Y > hem - 2) & (Y < hem + 11 + 5 * np.abs(np.sin((X - scx) / 5)))
+    paint(pet, 0.55 + 0.3 * (hash2(np.floor(X / 4), np.floor(Y / 4)) > 0.5), DRESS)
     skirt = (Y > wy) & (Y < hem) & (np.abs(u) < 1)
     tiers = sum(np.exp(-((Y - (wy + d) - 5 * np.abs(np.sin((X - scx) / 9))) / 4) ** 2) for d in (42, 86))
     shade = 0.62 + 0.3 * (1 - u ** 2) + 0.08 * np.sin(u * 15 + 2 * np.sin(p)) - 0.75 * tiers
     paint(skirt, np.clip(shade, 0, 1), DRESS, gap=True)
-    lace = (np.abs(u) < 1.02) & (Y > hem - 3) & (Y < hem + 9)
+    lace = (np.abs(u) < 1.02) & (Y > hem - 3) & (Y < hem + 6)
     paint(lace, 0.25 + 0.2 * (hash2(np.floor(X / 4), np.floor(Y / 4)) > 0.5), LACE)
     # bodice: shoulders taper to the waist
     k_b = np.clip((Y - 215 - bob) / (wy - 215 - bob), 0, 1)
     bod = (Y > 215 + bob) & (Y < wy + 2) & (np.abs(X - cx) < 52 - 27 * k_b ** 0.8)
     paint(bod, 0.75 + 0.2 * (1 - ((X - cx) / 52) ** 2), DRESS, gap=True)
-    # arms hang outside the torso and swing opposite the legs; puff sleeves on the shoulders
-    for side in (-1, 1):
-        sv = np.sin(p) * -side  # same-side leg forward (sin>0 for side -1) means this arm swings back
-        sx, sy = cx + side * 58, 228 + bob
-        hx, hy2 = sx + side * (24 + 4 * sv), 392 + bob - 30 * sv
-        paint(capsule(X, Y, sx + side * 4, sy + 10, hx, hy2, 5), 0.85, SKIN, gap=True)
-        paint(ellipse(X, Y, hx, hy2 + 4, 6, 8) < 1, 0.9, SKIN)
-        puff = ellipse(X, Y, sx, sy, 20, 17) < 1
-        paint(puff, 0.62 + 0.3 * (1 - ellipse(X, Y, sx - side * 5, sy - 6, 20, 17).clip(0, 1)), DRESS, gap=True)
-        paint((ellipse(X, Y, sx, sy + 14, 22, 6) < 1) & (Y > sy + 11), 0.3, LACE)
-    # waist bow: loops reach well past the hair on both sides
-    by = 312 + bob
+    # waist bow loops reach well past the hair on both sides (knot and tails come after the hair)
+    by = 304 + bob
     for side in (-1, 1):
         d = ellipse(X, Y, cx + side * 52, by, 36, 16, side * 0.25)
         paint(d < 1, 0.45 + 0.5 * np.clip(d, 0, 1) ** 2, BOW, gap=True)
+    # arms: shoulder -> elbow -> hand, swinging opposite the same-side leg; the forearm folds up as the arm goes forward
+    for side in (-1, 1):
+        a = side * np.sin(p)  # +1 arm forward (away from us), -1 arm back
+        sx, sy = cx + side * 62, 246 + bob
+        ex, ey = sx + side * 14, sy + 46 - 6 * a
+        hx, hy2 = ex + side * (14 + 16 * a), ey + 54 - 32 * a
+        paint(capsule(X, Y, sx, sy, ex, ey, 5.5) | capsule(X, Y, ex, ey, hx, hy2, 5), 0.85, SKIN, gap=True)
+        paint(ellipse(X, Y, hx, hy2 + 3, 7, 8) < 1, 0.9, SKIN)
+        puff = ellipse(X, Y, cx + side * 58, 228 + bob, 20, 17) < 1
+        paint(puff, 0.62 + 0.3 * (1 - ellipse(X, Y, cx + side * 53, 222 + bob, 20, 17).clip(0, 1)), DRESS, gap=True)
+        paint((ellipse(X, Y, cx + side * 58, 242 + bob, 22, 6) < 1) & (Y > 239 + bob), 0.3, LACE)
 
-    # hair: its own narrow column; roots fixed, tips swing late (follow-through, doubled amplitude)
+    # hair: its own narrow column; roots fixed, tips swing late (follow-through), ending around the upper ruffle tier
     k = np.clip((Y - 190 - bob) / 240, 0, 1) ** 1.5
     hcx = cx + (sway * 1.5 + 24 * np.sin(p - (Y - 200) / 120)) * k
     yy = Y - bob
     hwh = np.select(
-        [yy < 165, yy < 205, yy < 300],
+        [yy < 165, yy < 205, yy < 260],
         [40 * np.sqrt(np.clip(1 - ((yy - 165) / 47) ** 2, 0, 1)), 40 - (yy - 165) * 0.2, 32 + (yy - 205) * 0.085],
-        40 - (yy - 300) * 0.05,
+        36.7 - (yy - 260) * 0.2,
     )
     hwh = hwh * (1 + 0.04 * np.sin(yy / 13 + p))
     uh = (X - hcx) / np.maximum(hwh, 1)
-    tips = 352 + bob + 26 * (1 - uh ** 2) + 10 * np.sin(uh * 9.7) + 6 * np.sin(uh * 23 + p)
+    tri = np.abs((uh * 1.6 + 1) % 1 * 2 - 1)  # triangle wave: three ragged V-shaped locks across the width
+    tips = 312 + bob + 30 * (1 - tri) - 12 * uh ** 2 + 5 * np.sin(uh * 23 + p)
     hair = (np.abs(uh) < 1) & (Y > 118 + bob) & (Y < tips)
     sfield = uh * 40 + 2.5 * np.sin(yy / 47 + uh * 3)
     strands = 0.5 + 0.5 * np.sin(sfield)
     fine = 0.5 + 0.5 * np.sin(uh * 113 + yy / 31)
-    ring = np.exp(-((yy - (152 + 14 * uh ** 2)) / 9) ** 2) + 0.7 * np.exp(-((yy - (300 + 18 * uh ** 2)) / 9) ** 2)
+    ring = np.exp(-((yy - (152 + 14 * uh ** 2)) / 9) ** 2) + 0.3 * np.exp(-((yy - (270 + 18 * uh ** 2)) / 9) ** 2)
     lum = (0.22 + 0.3 * strands + 0.12 * fine) * (0.65 + 0.35 * (1 - uh ** 2)) + 0.45 * ring
     lum = lum * np.clip((tips - Y) / 18, 0.2, 1)  # tips thin out
     paint(hair, lum, HAIR, gap=True)
@@ -188,7 +197,12 @@ def girl(X, Y, t, L, P, hair_aux):
     gy, gx = np.gradient(sfield)
     phi2 = 2 * np.arctan2(-gy, gx)
     hair_aux[0][hair], hair_aux[1][hair], hair_aux[2][hair] = np.cos(phi2)[hair], np.sin(phi2)[hair], np.clip(ring, 0, 1)[hair]
-    # bow on the back of the head, tails trailing down over the hair
+    # waist bow knot and tails hang below the hair tips, trailing the sway
+    paint(ellipse(X, Y, cx, by, 9, 9) < 1, 0.95, BOW, gap=True)
+    for side in (-1, 1):
+        lag = 7 * np.sin(p - 0.8)
+        paint(capsule(X, Y, cx + side * 4, by + 4, cx + side * 13 + lag, by + 58, 5.5), 0.7 + 0.1 * side, BOW, gap=True)
+    # bow on the back of the head
     hby = 124 + bob
     for side in (-1, 1):
         d = ellipse(X, Y, cx + side * 36, hby, 38, 21, side * 0.35)
