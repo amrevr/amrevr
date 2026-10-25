@@ -2,7 +2,12 @@
 
 CS grad student at RPI, working on the agents/evals/data side of AI. I make context-aware agents because I'm tired of being the only one with situational awareness.
 
-I've spent the last few internships at PwC, Johnson & Johnson and Sandia National Laboratories building and evaluating LLM agents, and I'm now consulting on observability for agentic systems at UMB Financial.
+<p align="center">
+  <img src="assets/walk_cycle.gif" alt="ASCII girl with long hair and a bow walking away down a night road, to Cry by Aisin-Gioro and Toyoki" width="865"><br>
+  <a href="https://example.com/">Want to make something like this ✧｡٩(ˊᗜˋ )و✧*｡</a>
+</p>
+
+I've spent the last few summers building and evaluating LLM agents. Currently, I'm consulting for designing an observability and governance layer for agentic systems at a fintech bank.
 
 Outside of coursework I'm building [tiny-infer](https://github.com/amrevr/tiny-infer), an LLM inference engine from scratch (Python, then C++), and I'm generally interested in LLM evals and agent infrastructure.
 
@@ -18,3 +23,10 @@ I'm also a passionate retro enthusiast. Outside of my day-to-day work, I’m cre
 
 - 📧 [rijulrpi@gmail.com](mailto:rijulrpi@gmail.com)
 - 💼 [LinkedIn](https://www.linkedin.com/in/amrevr)
+
+<details>
+<summary>alternate walks</summary>
+
+[twirl](assets/variants/walk_twirl.gif) · [wave & skip](assets/variants/walk_waveskip.gif) · [look-back](assets/variants/walk_lookback.gif)
+
+</details>
