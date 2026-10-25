@@ -3,7 +3,10 @@
 CS grad student at RPI, working on the agents/evals/data side of AI. I make context-aware agents because I'm tired of being the only one with situational awareness.
 
 <p align="center">
-  <img src="assets/walk_cycle.gif" alt="ASCII girl with long hair and a bow walking away down a night road, to Cry by Aisin-Gioro and Toyoki" width="865"><br>
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="assets/walk_still.png">
+    <img src="assets/walk_cycle.gif" alt="ASCII girl with long hair and a bow walking away down a night road, to Cry by Aisin-Gioro and Toyoki" width="865">
+  </picture><br>
   <a href="https://example.com/">Want to make something like this ✧｡٩(ˊᗜˋ )و✧*｡</a>
 </p>
 
