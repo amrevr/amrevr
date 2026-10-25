@@ -1,25 +1,43 @@
-"""Generates walk.gif: a shaded-ASCII loop of an original girl who faces the camera, does a little jig, spins away with a hair whip,
-walks off down a night road, then turns back to face the camera again.
+"""Generates walk.gif: a shaded-ASCII loop of an original (faceless) girl who faces the camera, does a little jig, spins away with a hair
+whip, walks off down a night road, then turns back to face the camera again.
 
 The scene is drawn as luminance + part maps, shaded into RGB, then box-averaged over small square cells
-in the manner of ezascii.com: each cell picks a glyph by luminance ** exponent and is inked in its own colour. Everything is periodic in the loop phase, so it loops cleanly.
-Run: uv run --with numpy --with pillow assets/make_walk.py
+in the manner of ezascii.com: each cell picks a glyph by luminance ** exponent and is inked in its own colour.
+Run: uv run --with numpy --with pillow assets/make_walk.py      (writes assets/walk.gif, the classic timeline)
+
+WRITING A VARIANT (a separate script that imports this module and supplies its own timeline)
+    import sys; sys.path.insert(0, "<repo>/assets"); import make_walk as mw
+    tl = mw.Timeline(nf, pose_fn)      # pose_fn(f) -> mw.Pose for every integer f in 0..nf INCLUSIVE; frame nf is the frame after the last
+    mw.render_gif(tl, "out.gif")       # checks the loop, renders frames 0..nf-1, saves with the shared palette / optimiser settings
+A variant must provide: nf (frames, 80 ms each) and pose_fn. Everything else (girl, background, shading, glyphs) is reused. Build pose_fn from
+the helpers or by hand: mw.Keys (Catmull-Rom yaw/squat/tuck/arm keys), mw.jig_at, mw.springs (hair / ribbon / skirt dynamics), mw.gait
+(gait phase, walk amplitude, travel; mw.walk_amp is the amplitude ramp), mw.make_pose_fn (glues them into a pose_fn), or return Pose(...) directly.
+See classic_timeline() for a full example; Timeline.travel_fn(f) is just pose_fn(f).travel.
+
+LOOP CHECK (mw.check_loop(tl), run by render_gif): pose_fn(nf) must equal pose_fn(0): the same rest pose fields, yaw modulo 360 degrees, gait phase
+`fl` modulo 2 pi, jig phase `wph`, fidget clock `t` modulo nf, and identical rendered characters. TRAVEL must also come back: pose.travel is metres
+walked since frame 0, and it must END EQUAL TO ITS START MODULO 2.8 m (STEP_M * 2, the lamp spacing and road-dash period), so the road and the
+lamps wrap seamlessly. In practice: walk a whole even number of strides in total (gait(..., strides=2, 4, ...)), or not at all (travel = 0).
+A pose's `loop` field must equal nf (the hand fidget and the twinkling stars are periodic in it); make_pose_fn sets it for you.
 """
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
 COLS, ROWS, SS, CELL = 173, 120, 3, 5  # square character grid (CELL px pitch), supersamples per cell side
 STRIDE_FRAMES, STRIDES, FRAME_MS = 14, 2, 80  # base cadence: 14 frames per stride (two steps); she covers exactly 2 strides (= the lamp spacing) per loop
-# ---- segment boundaries (frames at 80 ms; yaw 180 = facing the camera, 0 = back) ----
-IDLE_N = 6                     # 0..5   front idle: hands at the chest bow, breathing, one blink
+# ---- BASE segment boundaries, before the inserted walk block(s) shift WIND_FROM and later by BLOCK (frames at 80 ms; yaw 180 = facing the camera, 0 = back) ----
+IDLE_N = 6                     # 0..5   front idle: hands at the chest bow, breathing
 JIG_FROM, JIG_N = 6, 18        # 6..23  the jig: two knee-dips, hip sway, shoulder shimmy, head tilts, a wave
 TURN_FROM = 24                 # 24..25 anticipation crouch, 26..28 spin to the back, 29..33 overshoot and settle
 WALK_FROM = 32                 # left heel strike, during the settle; gait cadence starts 2 frames earlier
 WIND_FROM, STOP_AT = 49, 57    # wind-down start; standstill (frame 57 stands with her back to us)
-RET_FROM, NF = 58, 68          # 58..59 small crouch, 60..62 spin to the front, 63..67 settle; frame NF is frame 0 again
+RET_FROM, BASE_NF = 58, 68     # 58..59 small crouch, 60..62 spin to the front, 63..67 settle; frame nf is frame 0 again
+AMP_RAMP = 4                   # walk amplitude reaches 100% this many frames after WALK_FROM (frame 36)
+INSERT_AT, BLOCK = 36, 24      # classic_timeline() inserts BLOCK full-amplitude walk frames here, per block
 FONT = ImageFont.truetype("/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf", 8)  # glyphs are centred, so the 4.8 px advance is harmless
 CW = LH = CELL
 W, H = COLS * CW, ROWS * LH
@@ -33,7 +51,7 @@ BG_CUT = 0.02  # only true blacks are left empty
 BG_FLOOR, BG_GAIN = 0.12, 3.0  # scene shading: dim L still shows its colour; BG_GAIN stretches the faint L of sky/grass/road
 HAIR_TIP, HAIR_SHADOW = 0.12, 0.3  # hair luminance below which glyphs are tip marks / dense letters
 
-SKY, STAR, TREE, GRASS, ROAD, DASH, POST, GLOW, HAIR, HAIR_S, BOW, BOW_S, BLOUSE, TRIM, SKIRT, SKIRT_S, RUFFLE, SKIN, SOCK, SHOE, PUPIL, BLUSH, LIP = range(23)
+SKY, STAR, TREE, GRASS, ROAD, DASH, POST, GLOW, HAIR, HAIR_S, BOW, BOW_S, BLOUSE, TRIM, SKIRT, SKIRT_S, RUFFLE, SKIN, SOCK, SHOE, BLUSH = range(21)
 COLOURS = np.array([
     (70, 50, 140), (255, 245, 215), (35, 95, 65), (45, 125, 65), (125, 105, 165), (250, 215, 110),
     (110, 100, 150), (255, 215, 150),
@@ -42,9 +60,9 @@ COLOURS = np.array([
     (253, 250, 251), (43, 58, 107),           # blouse, navy trim
     (201, 168, 245), (112, 74, 206), (204, 198, 205),  # skirt, skirt shadow, ruffle
     (241, 207, 198), (250, 250, 252), (90, 52, 35),    # skin, sock, loafer
-    (58, 40, 78), (250, 130, 160), (215, 80, 110),     # eyes, blush, lips
+    (244, 128, 158),                                   # blush (the face has no eyes or mouth)
 ], float)
-GIRL_PARTS = list(range(HAIR, LIP + 1))
+GIRL_PARTS = list(range(HAIR, BLUSH + 1))
 
 # camera: horizon line, focal length (px), eye height (m); she walks 1.4 m per stride
 HOR, VPX, F, EYE, STEP_M = 230.0, W * 0.47, 626.0, 1.3, 1.4
@@ -155,14 +173,15 @@ def round_lum(s, lo, hi):
     """Round-limb shading: lit from the left, falling off toward the far edge."""
     return lo + (hi - lo) * np.exp(-((s + 0.35) / 0.9) ** 2)
 
-# ---- timeline: front idle -> jig -> spin away -> walk -> wind-down -> spin back to the front, one pose per frame ----
+# ---- timeline: a Timeline is nf poses; the classic one runs front idle -> jig -> spin away -> walk -> wind-down -> spin back to the front ----
 @dataclass
 class Pose:
-    """Everything that changes between frames. The defaults are the front idle pose (frame 0 and frame NF)."""
-    t: float = 0.0         # frame number; only drives the hands' fidget, which is periodic in the loop
-    fl: float = 0.0        # gait phase, radians (frame WALK_FROM is the left heel strike = 0)
+    """Everything that changes between frames. The defaults are the front idle pose (frame 0 and frame nf)."""
+    t: float = 0.0         # frame number; only drives the hands' fidget, which is periodic in `loop`
+    loop: int = 68         # frames in the loop (set it to the timeline's nf)
+    fl: float = 0.0        # gait phase, radians (0 = left heel strike)
     amp: float = 0.0       # walk amplitude 0..1: bob, sway, twist, arm swing, hair/ribbon/hem lag
-    travel: float = 0.0    # metres walked since frame 0
+    travel: float = 0.0    # metres walked since frame 0 (must end equal to its start modulo STEP_M * 2)
     yaw_hip: float = np.pi  # turn about the vertical axis, radians: 0 = back to us, pi = facing us, + = the face swings toward screen-left;
     yaw_sh: float = np.pi   # the shoulders and head lead the hips
     yaw_head: float = np.pi
@@ -175,7 +194,6 @@ class Pose:
     htilt: float = 0.0     # head tilt, radians, + = crown toward screen-right
     wave: float = 0.0      # 0..1 right hand raised from the bow, waving at phase wph
     wph: float = 0.0
-    blink: float = 0.0
     bob: float = 0.0       # breathing, fractions of H
     fan: float = 0.0       # spin speed 0..1: the hair and hem fan out
     whip: float = 0.0      # hair tip angle off the spine, radians, + = streaming toward screen-left
@@ -184,12 +202,19 @@ class Pose:
     hem_x: float = 0.0     # hem lag offset, fractions of H
     bounce: float = 0.0    # vertical lag of the hair tips, signed
 
+@dataclass
+class Timeline:
+    """A looping animation: nf frames (FRAME_MS each). pose_fn(f) -> Pose must work for every integer f in 0..nf; pose_fn(nf) must flow into pose_fn(0)."""
+    nf: int
+    pose_fn: Callable[[int], Pose]
+    def travel_fn(self, f):
+        return self.pose_fn(f).travel
+
 # The two spins, keyed per frame (80 ms): yaw in degrees (+ = the face swings toward screen-left), knee bend, hands tucked in at the chest,
 # the near / far arm swinging out. Catmull-Rom between neighbouring frames; before the first key she faces us, and a gap between keys holds the
-# earlier one (walk). The jig and the idle are parametric (jig_at, pose_at).
+# earlier one (walk). The jig and the idle are parametric (jig_at, make_pose_fn).
 SH_LEAD, HEAD_LEAD = 0.25, 0.5  # shoulders and head sample the yaw curve this many frames ahead of the hips
-KEYS = {
-    # frame  yaw  squat tuck near far
+SPIN_AWAY = {  # frame  yaw  squat tuck near far
     23: (180,  0.0, 0.0, 0.0, 0.0),   # the jig ends upright
     24: (180,  0.6, 1.0, 0.0, 0.0),   # anticipation: dip, hands pull in
     25: (180,  1.0, 1.0, 0.0, 0.0),   #
@@ -201,43 +226,51 @@ KEYS = {
     31: (  2,  0.0, 0.0, 0.3, 0.3),   # ... and settles; the first step lands at WALK_FROM
     32: (  0,  0.0, 0.0, 0.1, 0.1),
     33: (  0,  0.0, 0.0, 0.0, 0.0),
-    58: (  0,  0.4, 0.0, 0.0, 0.0),   # the return: a light dip ...
-    59: (  0,  0.7, 0.0, 0.0, 0.0),
-    60: (-58,  0.2, 0.0, 0.5, 0.5),   # ... and a quicker spin the other way round, through the right-hand profile
-    61: (-134, 0.0, 0.0, 0.8, 0.8),
-    62: (-188, 0.0, 0.0, 0.6, 0.6),   # a little overshoot
-    63: (-173, 0.0, 0.0, 0.3, 0.3),
-    64: (-182, 0.0, 0.0, 0.1, 0.1),
-    65: (-180, 0.0, 0.0, 0.0, 0.0),   # landed on the front idle pose
-    66: (-180, 0.0, 0.0, 0.0, 0.0),
-    67: (-180, 0.0, 0.0, 0.0, 0.0),
-    68: (-180, 0.0, 0.0, 0.0, 0.0),   # = frame 0 again (yaw -180 is yaw 180)
 }
-KF = sorted(KEYS)
-KV = np.array([KEYS[k] for k in KF], float)
+SPIN_BACK = {  # frame relative to RET_FROM (the walk is over, standing with her back to us at RET_FROM - 1)
+    0: (  0,  0.4, 0.0, 0.0, 0.0),   # the return: a light dip ...
+    1: (  0,  0.7, 0.0, 0.0, 0.0),
+    2: (-58,  0.2, 0.0, 0.5, 0.5),   # ... and a quicker spin the other way round, through the right-hand profile
+    3: (-134, 0.0, 0.0, 0.8, 0.8),
+    4: (-188, 0.0, 0.0, 0.6, 0.6),   # a little overshoot
+    5: (-173, 0.0, 0.0, 0.3, 0.3),
+    6: (-182, 0.0, 0.0, 0.1, 0.1),
+    7: (-180, 0.0, 0.0, 0.0, 0.0),   # landed on the front idle pose
+    8: (-180, 0.0, 0.0, 0.0, 0.0),
+    9: (-180, 0.0, 0.0, 0.0, 0.0),
+    10: (-180, 0.0, 0.0, 0.0, 0.0),  # = frame 0 again (yaw -180 is yaw 180)
+}
 
-def keys_at(f):
-    """Catmull-Rom through KEYS at (fractional) frame f: yaw (deg), squat, tuck, near, far."""
-    if f < KF[0]:
-        return KV[0]
-    if f >= KF[-1]:
-        return KV[-1]
-    i = max(j for j in range(len(KF)) if KF[j] <= f)
-    if KF[i + 1] - KF[i] > 1:
-        return KV[i]
-    u = f - KF[i]
-    p1, p2 = KV[i], KV[i + 1]
-    p0 = KV[i - 1] if i > 0 and KF[i] - KF[i - 1] == 1 else p1
-    p3 = KV[i + 2] if i + 2 < len(KF) and KF[i + 2] - KF[i + 1] == 1 else p2
-    k = 0.5 * ((2 * p1) + (p2 - p0) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u ** 2 + (3 * p1 - p0 - 3 * p2 + p3) * u ** 3)
-    return np.concatenate([k[:1], np.maximum(k[1:], 0)])  # the spline must not undershoot rest on the knees and arms
+class Keys:
+    """Catmull-Rom through a {frame: (yaw deg, squat, tuck, near, far)} table; keys(f) works at fractional frames. Before the first key she faces us
+    (yaw 180 is only right if the first key says so); after the last key the last one holds; a gap between keys holds the earlier one."""
+    def __init__(self, table):
+        self.kf = sorted(table)
+        self.kv = np.array([table[k] for k in self.kf], float)
+    def __call__(self, f):
+        KF, KV = self.kf, self.kv
+        if f < KF[0]:
+            return KV[0]
+        if f >= KF[-1]:
+            return KV[-1]
+        i = max(j for j in range(len(KF)) if KF[j] <= f)
+        if KF[i + 1] - KF[i] > 1:
+            return KV[i]
+        u = f - KF[i]
+        p1, p2 = KV[i], KV[i + 1]
+        p0 = KV[i - 1] if i > 0 and KF[i] - KF[i - 1] == 1 else p1
+        p3 = KV[i + 2] if i + 2 < len(KF) and KF[i + 2] - KF[i + 1] == 1 else p2
+        k = 0.5 * ((2 * p1) + (p2 - p0) * u + (2 * p0 - 5 * p1 + 4 * p2 - p3) * u ** 2 + (3 * p1 - p0 - 3 * p2 + p3) * u ** 3)
+        return np.concatenate([k[:1], np.maximum(k[1:], 0)])  # the spline must not undershoot rest on the knees and arms
 
 JIG_SQUAT, JIG_SWAY = 0.8, 0.022  # two dips this deep; the hips swing this far (H) from side to side, once across both dips
-def jig_at(f):
-    """The jig, parametric over JIG_FROM .. JIG_FROM + JIG_N: sway, shoulder roll, head tilt, knee bend, wave amount and phase.
+def jig_at(f, jig_from=JIG_FROM, jig_n=JIG_N):
+    """The jig, parametric over jig_from .. jig_from + jig_n (jig_from=None: no jig): sway, shoulder roll, head tilt, knee bend, wave amount and phase.
     Everything is 0 at both ends. Two dips (u = 0.25, 0.75) with the hips swung to opposite sides on them; four shoulder shimmies;
     the head tilts left then right; the right hand leaves the bow between u = 0.3 and 0.88 to wave."""
-    u = (f - JIG_FROM) / JIG_N
+    if jig_from is None:
+        return np.zeros(6)
+    u = (f - jig_from) / jig_n
     if not 0 < u < 1:
         return np.zeros(6)
     env = smooth(min(u, 1 - u) * 6)
@@ -245,26 +278,28 @@ def jig_at(f):
                      -np.radians(9) * np.sin(2 * np.pi * u) * env, JIG_SQUAT * (0.5 - 0.5 * np.cos(4 * np.pi * u)),
                      smooth((u - 0.30) / 0.10) * smooth((0.88 - u) / 0.10), 2 * np.pi * 4 * u])
 
-def squat_at(f):
-    return keys_at(f)[1] + jig_at(f)[3]
-
 # hair, ribbons, skirt, vertical lag: natural frequency (rad/s), damping, gain (hair angle per rad, ribbon offset H per rad, skirt flare per rad, lag per unit)
 SPRING_W, SPRING_ZETA = np.array([13.0, 8.0, 10.0, 11.0]), np.array([0.3, 0.3, 0.35, 0.35])
 SPRING_GAIN = np.array([3.3, 0.08, 0.9, 2.0])
 SWAY_COUPLE, RET_GAIN = 8.0, 0.6  # head sway (H) counts this much as yaw (rad) for the springs; the return spin drives them this much as the first
 
-def springs():
+def head_drive(keys, jig_from=JIG_FROM, ret_from=None):
+    """drive(f) -> [head yaw (rad, plus the jig's sway), squat] for springs(); the return spin (f >= ret_from - 1) drives them RET_GAIN as hard."""
+    def drive(f):
+        jg = jig_at(f, jig_from)
+        yaw = np.radians(keys(f + HEAD_LEAD)[0]) * (RET_GAIN if ret_from is not None and f >= ret_from - 1 else 1)
+        return np.array([yaw + SWAY_COUPLE * (0.5 * jg[0] + 0.07 * np.sin(jg[2])), keys(f)[1] + jg[3]])
+    return drive
+
+def springs(nf, drive):
     """Hair, ribbons and skirt as damped springs driven by the head's yaw acceleration (and its sideways sway): a'' = -drive'' - 2 zeta w a' - w^2 a.
     The turn starts, they lag; the turn stops, they swing on; the turn back overshoots; ~1.5 swings later they are still. A fourth spring is
-    driven by the vertical acceleration of the knee dips. Outputs are soft-limited, and fade out over the last 3 frames so the loop closes."""
+    driven by the vertical acceleration of the knee dips. drive(f) -> [yaw, squat] (see head_drive). Returns an (nf + 1, 4) table
+    [whip, tail, skirt, bounce]; outputs are soft-limited and fade out over the last 3 frames so the loop closes."""
     sub = 16
     dt = FRAME_MS / 1000 / sub
-    def drive(f):
-        yaw = np.radians(keys_at(f + HEAD_LEAD)[0]) * (RET_GAIN if f >= RET_FROM - 1 else 1)
-        hx = 0.5 * jig_at(f)[0] + 0.07 * np.sin(jig_at(f)[2])
-        return np.array([yaw + SWAY_COUPLE * hx, squat_at(f)])
     a, v, out = np.zeros(4), np.zeros(4), [np.zeros(4)]
-    for i in range(NF * sub):
+    for i in range(nf * sub):
         f = i / sub
         acc = (drive(f + 1 / sub) - 2 * drive(f) + drive(f - 1 / sub)) / dt ** 2
         acc = np.array([acc[0], acc[0], acc[0], acc[1]])
@@ -274,35 +309,54 @@ def springs():
             out.append(a.copy())
     out = np.array(out) * SPRING_GAIN
     out[:, 0], out[:, 1] = 1.45 * np.tanh(out[:, 0] / 1.45), 0.3 * np.tanh(out[:, 1] / 0.3)
-    out *= smooth((NF - np.arange(NF + 1)) / 3)[:, None]
+    out *= smooth((nf - np.arange(nf + 1)) / 3)[:, None]
     out[np.abs(out) < 2e-3] = 0  # sub-pixel residue
     return out
 
-def gait():
-    """Gait phase, walk amplitude and distance per frame. Cadence eases in, then eases out over the wind-down (steps shorten to nothing);
-    its scale is solved so she covers exactly STRIDES strides, so travel wraps with the lamps and the road dashes."""
-    f = np.arange(NF + 1)
-    wind = smooth((STOP_AT - f) / (STOP_AT - WIND_FROM))
-    e = smooth((f - (WALK_FROM - 2)) / 5) * wind
-    c = e[:NF] * STRIDES / e[:NF].sum()               # strides per frame
+def walk_amp(f, walk_from, ramp=AMP_RAMP):
+    """Walk amplitude 0..1: 50% over the 3 frames before walk_from (the settle), then up to 100% over `ramp` frames. Full from walk_from + ramp."""
+    return 0.5 * smooth((f - (walk_from - 3)) / 3) + 0.5 * smooth((f - walk_from) / ramp)
+
+def gait(nf, walk_from, wind_from, stop_at, strides, ramp=AMP_RAMP):
+    """Returns (fl, amp, travel), each of length nf + 1. Cadence eases in from walk_from - 2, runs steady, then eases out over wind_from .. stop_at
+    (steps shorten to nothing, amp -> 0). Its scale is solved so she covers exactly `strides` strides (STEP_M each): use an even number so travel
+    wraps with the lamps and the road dashes. fl = 0 (left heel strike) at walk_from."""
+    f = np.arange(nf + 1)
+    wind = smooth((stop_at - f) / (stop_at - wind_from))
+    e = smooth((f - (walk_from - 2)) / 5) * wind
+    c = e[:nf] * strides / e[:nf].sum()               # strides per frame
     stride = np.concatenate([[0], np.cumsum(c)])      # strides walked since frame 0
-    fl = 2 * np.pi * (stride - stride[WALK_FROM])     # heel strike at WALK_FROM
-    amp = (0.5 * smooth((f - (WALK_FROM - 3)) / 3) + 0.5 * smooth((f - WALK_FROM) / STRIDE_FRAMES)) * wind  # 50% -> 100% over the first 2 steps
-    return fl, amp, stride * STEP_M
+    fl = 2 * np.pi * (stride - stride[walk_from])
+    return fl, walk_amp(f, walk_from, ramp) * wind, stride * STEP_M
 
-SPRING, (GAIT_FL, GAIT_AMP, GAIT_TRAVEL) = springs(), gait()
-BLINK_AT = (3,)  # one blink during the front idle
+def make_pose_fn(nf, keys, spr, gt, jig_from=None, idle_n=0):
+    """Glue for a pose_fn: keys = Keys(...), spr = springs(...) table, gt = gait(...) tuple, jig_from = start of the jig (or None), idle_n = frames of
+    breathing at the start. Returns pose_fn(f) -> Pose for f in 0..nf."""
+    fl, amp, travel = gt
+    def pose_at(f):
+        k, jg = keys(f), jig_at(f, jig_from)
+        yaw = lambda lead: np.radians(keys(f + lead)[0]) % (2 * np.pi)  # an angle: -180 and 180 are the same bits
+        whip, tail, skirt, bounce = spr[f]
+        fan = min(abs(keys(f + 0.5)[0] - keys(f - 0.5)[0]) / 75, 1)
+        sk = min(abs(skirt), 1)
+        return Pose(t=f, loop=nf, fl=fl[f], amp=amp[f], travel=travel[f], yaw_hip=yaw(0), yaw_sh=yaw(SH_LEAD), yaw_head=yaw(HEAD_LEAD),
+                    squat=k[1] + jg[3], tuck=k[2], near=k[3], far=k[4], sway=jg[0], shim=jg[1], htilt=jg[2], wave=jg[4], wph=jg[5],
+                    bob=0.005 * np.sin(np.pi * f / idle_n) if f < idle_n else 0.0, fan=fan, whip=whip, tail_x=-tail,
+                    flare=min(sk + 0.8 * fan + 0.4 * min(abs(bounce), 1), 1), hem_x=-0.05 * np.sign(skirt) * sk, bounce=bounce)
+    return pose_at
 
-def pose_at(f):
-    """Pose at integer frame f in 0..NF (NF is the frame after the last, which must flow into frame 0)."""
-    k, jg = keys_at(f), jig_at(f)
-    yaw = lambda lead: np.radians(keys_at(f + lead)[0]) % (2 * np.pi)  # an angle: -180 and 180 are the same bits
-    whip, tail, skirt, bounce = SPRING[f]
-    fan = min(abs(keys_at(f + 0.5)[0] - keys_at(f - 0.5)[0]) / 75, 1)
-    sk = min(abs(skirt), 1)
-    return Pose(f, GAIT_FL[f], GAIT_AMP[f], GAIT_TRAVEL[f], yaw(0), yaw(SH_LEAD), yaw(HEAD_LEAD), k[1] + jg[3], k[2], k[3], k[4],
-                jg[0], jg[1], jg[2], jg[4], jg[5], float(f in BLINK_AT), 0.005 * np.sin(np.pi * f / IDLE_N) if f < IDLE_N else 0.0, fan,
-                whip, -tail, min(sk + 0.8 * fan + 0.4 * min(abs(bounce), 1), 1), -0.05 * np.sign(skirt) * sk, bounce)
+def classic_timeline(blocks=1):
+    """The classic walk.gif timeline. `blocks` extra full-amplitude BLOCK-frame walk stretches are inserted at INSERT_AT (the first full-amplitude
+    frame); everything after (wind-down, return spin) shifts along, and the solved cadence still covers exactly 2 * (1 + blocks) strides."""
+    n = BLOCK * blocks
+    wind_from, stop_at, ret_from, nf = WIND_FROM + n, STOP_AT + n, RET_FROM + n, BASE_NF + n
+    keys = Keys({**SPIN_AWAY, **{ret_from + k: v for k, v in SPIN_BACK.items()}})
+    spr = springs(nf, head_drive(keys, JIG_FROM, ret_from))
+    gt = gait(nf, WALK_FROM, wind_from, stop_at, STRIDES * (1 + blocks))
+    return Timeline(nf, make_pose_fn(nf, keys, spr, gt, JIG_FROM, IDLE_N))
+
+CLASSIC = classic_timeline()
+pose_at, NF = CLASSIC.pose_fn, CLASSIC.nf
 
 def bend(X, Y, rx, ry, theta, length):
     """Straighten a hair spine that hangs from (rx, ry) and curls by theta (radians at its tip, growing as s**1.6, + = toward screen-left).
@@ -344,7 +398,7 @@ def girl(X, Y, pz, L, P, hair_aux):
     A = pz.amp                             # the walk's amplitudes all scale with the gait amplitude
     SWAY, HIP_TILT = 0.025 * A, np.radians(4) * A
     HIP_YAW, SH_YAW, SH_TILT, TWIST_GAIN = np.radians(10), np.radians(15), np.radians(5) * A, 1.8 * A
-    ARM_SWING, HAIR_SWAY, TAIL_SWAY, HEM_SWAY = np.radians(25) * A, 0.035 * A, 0.06 * A, 0.03 * A
+    ARM_SWING, HAIR_SWAY, TAIL_SWAY, HEM_SWAY = np.radians(15) * A, 0.035 * A, 0.06 * A, 0.03 * A
     HAIR_LAG, TAIL_LAG, HEM_LAG = 0.15 * 2 * np.pi, 0.25 * 2 * np.pi, 0.1 * 2 * np.pi
     Yh, Ys, Yd = pz.yaw_hip, pz.yaw_sh, pz.yaw_head   # spin (0 = back; the walk's own twist is separate)
     front = np.cos(Ys) < 0                 # facing us: the whole figure is drawn from the front
@@ -408,7 +462,7 @@ def girl(X, Y, pz, L, P, hair_aux):
         trim = collar & (((dcol > 0.010 * H) & (dcol < 0.019 * H)) | ((dcol > 0.029 * H) & (dcol < 0.038 * H)))
         paint(trim, 0.7, TRIM)
 
-        # ---- arms: swing opposite the same-side leg, elbow bent 30-50 deg, hand trails outward on the backswing ----
+        # ---- arms: swing opposite the same-side leg, elbow bent ~15-30 deg, arms hang close to the body, swing mostly fore/aft ----
         sleeves = []
         for side in (-1, 1):
             u = side * np.cos(fl)
@@ -420,9 +474,9 @@ def girl(X, Y, pz, L, P, hair_aux):
             sdx = side * SH_HALF * np.cos(yaw_s)
             sy_off = side * tilt_s * SH_HALF * H * 0.9
             sx, sy = shx + sdx * H, yy(0.215) + sy_off
-            be = np.radians(4 + 9 * back)
-            fle = np.radians(34 + 12 * A * u)
-            bf = be + np.radians(10 * back + 6 * A * np.sin(fl * 2 + side))  # loose flick
+            be = np.radians(2 + 3 * back)
+            fle = np.radians(22 + 6 * A * u)
+            bf = be + np.radians(3 * back + 1.5 * A * np.sin(fl * 2 + side))  # slight wrist flick
             be += ia * (np.radians(18 if side < 0 else 35) - be)
             bf += ia * (np.radians(30 if side < 0 else -10) - bf)
             h0 = 1 - 0.215
@@ -558,28 +612,11 @@ def girl(X, Y, pz, L, P, hair_aux):
         paint(cap, 0.45 + 0.25 * (0.5 + 0.5 * np.sin(U * 300)), HAIR)
         skin = head & face_side
         paint(skin, 0.92 - 0.25 * np.clip((V + 0.01) / 0.07, 0, 1) ** 2 - 0.12 * (U / 0.052) ** 2 - 0.06 * U / 0.052, SKIN)
-        if abs(sd_) > 0.55:  # profile: a nose and chin hint on the silhouette
-            sg = -np.sign(sd_)
-            paint(ellipse(U, V, sg * 0.054, 0.016, 0.009, 0.010) < 1, 0.85, SKIN)
-            paint(ellipse(U, V, sg * 0.030, 0.062, 0.016, 0.009) < 1, 0.7, SKIN)
-        # face: two big dark eyes with a highlight, blush, a small smile; it foreshortens and slides with the turn
+        # faceless: no eyes, nose or mouth, only a light blush on each cheek; it foreshortens and slides with the turn (profile: a plain silhouette)
         w = max(cd_, 0.25)
         fx = lambda u0: u0 * cd_ - 0.05 * sd_
         for sg in (-1, 1):
-            Uc, Ve = fx(sg * 0.027), 0.012
-            e = ((U - Uc) / (0.0140 * w)) ** 2 + ((V - Ve) / 0.0200) ** 2
-            if pz.blink:
-                arc = np.abs(V - (Ve + 0.008 - 0.007 * ((U - Uc) / (0.0125 * w)) ** 2)) < 0.0035
-                eye = arc & (np.abs(U - Uc) < 0.0135 * w)
-                paint(eye & skin, 0.3, PUPIL)
-            else:
-                eye = (e < 1) & skin
-                paint(eye, 0.3 + 0.5 * np.clip((V - Ve) / 0.0185 + 0.2, 0, 1) ** 1.5, PUPIL)
-                paint(eye & (V - Ve < -0.010), 0.2, PUPIL)  # darker upper lid
-                paint((ellipse(U, V, Uc + 0.005 * w, Ve - 0.0065, 0.0058 * w, 0.0058) < 1) & eye, 1.0, BLOUSE)
-            paint((ellipse(U, V, fx(sg * 0.041), 0.042, 0.0150 * w, 0.0085) < 1) & skin, 0.85, BLUSH)
-        mth = (np.abs(U - fx(0)) < 0.0125 * w) & (np.abs(V - (0.054 - 0.008 * ((U - fx(0)) / (0.0125 * w)) ** 2)) < 0.0034)
-        paint(mth & skin, 0.8, LIP)
+            paint((ellipse(U, V, fx(sg * 0.036), 0.036, 0.020 * w, 0.0115) < 1) & skin, 0.95, BLUSH)
         # bangs across the forehead, parted at the centre, with a sheen ring; strands slant outward and down
         ub = (U + 0.05 * sd_) / max(cd_, 0.35)
         vt = V + 0.07
@@ -600,7 +637,7 @@ def girl(X, Y, pz, L, P, hair_aux):
             sc = 1 + side * 0.4 * s_s
             sx, sy_off = shx + side * SH_HALF * abs(c_s) * H, side * tilt_s * SH_HALF * H * 0.9
             sx, sy = sx, yy(0.215) + sy_off
-            fid = 2 * np.pi * 17 * pz.t / NF + 1.3 * side      # the fidget: four frames per cycle, periodic over the loop
+            fid = 2 * np.pi * 17 * pz.t / pz.loop + 1.3 * side      # the fidget: four frames per cycle, periodic over the loop
             hold = (1 - pz.tuck) * (1 - 0.8 * (pz.near if side > 0 else pz.far))
             hand = np.array([shx + side * 0.020 * H + hold * 0.006 * H * np.cos(fid), yy(0.300) + hold * 0.005 * H * np.sin(2 * fid)])
             tuck = np.array([shx + side * 0.008 * H, yy(0.310)])
@@ -725,15 +762,15 @@ def enhance(rgb):
     rgb = np.clip(grey + (rgb - grey) * SATURATION, 0, 255)
     return 255 * (rgb / 255) ** (1 / GAMMA)
 
-def frame(f):
-    """Returns (chars, colours) grids for frame f."""
+def frame(tl, f):
+    """Returns (chars, colours) grids for frame f of Timeline tl."""
     ys, xs = ((np.arange(n * SS) + 0.5) / SS for n in (ROWS, COLS))
     X, Y = np.meshgrid(xs * CW, ys * LH)
     L, P = np.zeros_like(X), np.zeros(X.shape, int)
     aux = [np.zeros_like(X) for _ in range(3)]  # hair strand tangent (cos2a, sin2a) and highlight
     T = np.zeros_like(X)
-    pz = pose_at(f)
-    background(X, Y, (f % NF) / NF, pz.travel, L, P, T)
+    pz = tl.pose_fn(f)
+    background(X, Y, (f % tl.nf) / tl.nf, pz.travel, L, P, T)
     girl(X, Y, pz, L, P, aux)
     cell = lambda a: a.reshape(ROWS, SS, COLS, SS, *a.shape[2:]).mean(axis=(1, 3))
     col = enhance(cell(shade_rgb(P, L, T, X, Y)))
@@ -757,10 +794,10 @@ def frame(f):
     ink = col * np.clip(INK_MIN / np.maximum(col.max(-1, keepdims=True), 1), 1, INK_GAIN)
     return chars, np.clip(ink, 0, 255).astype(int)
 
-def render(f):
+def render(tl, f):
     img = Image.new("RGB", (round(W), round(H) + 22), (18, 14, 24))
     d = ImageDraw.Draw(img)
-    chars, col = frame(f)
+    chars, col = frame(tl, f)
     for r in range(ROWS):
         for c in range(COLS):
             if chars[r, c] != " ":  # centred in its cell, like ezascii's textAlign/textBaseline middle
@@ -769,28 +806,36 @@ def render(f):
     d.text((W / 2, H + 11), "♪ now playing: cry — aisin-gioro & toyoki", font=cap, fill=(185, 163, 196), anchor="mm")
     return img
 
-def check_loop():
-    """The frame after the last must flow into frame 0: the same pose (yaw compared as an angle), springs at rest, gait phase back
-    on the beat, the road wrapped by a whole number of lamp spacings, and identical characters."""
-    a, b = pose_at(0), pose_at(NF)
-    fields = ("amp", "squat", "tuck", "near", "far", "sway", "shim", "htilt", "wave", "blink", "bob", "fan", "whip", "tail_x", "flare", "hem_x", "bounce")
+def check_loop(tl):
+    """The frame after the last must flow into frame 0: the same rest pose (yaw compared as an angle), gait phase back on the beat, the road
+    wrapped by a whole number of lamp spacings (travel ends equal to its start modulo STEP_M * 2), and identical characters."""
+    a, b = tl.pose_fn(0), tl.pose_fn(tl.nf)
+    fields = ("amp", "squat", "tuck", "near", "far", "sway", "shim", "htilt", "wave", "bob", "fan", "whip", "tail_x", "flare", "hem_x", "bounce")
     assert np.allclose([getattr(a, k) for k in fields], [getattr(b, k) for k in fields], atol=1e-3), "rest pose must return"
-    assert abs(a.wph - b.wph) < 1e-6 and abs(a.t % NF - b.t % NF) < 1e-6, "jig phase and fidget clock must return"
+    assert abs(a.wph - b.wph) < 1e-6 and abs(a.t % tl.nf - b.t % tl.nf) < 1e-6, "jig phase and fidget clock must return"
+    assert a.loop == b.loop == tl.nf, "Pose.loop must equal the timeline's nf"
     for k in ("yaw_hip", "yaw_sh", "yaw_head"):
         assert abs(np.sin(getattr(a, k) - getattr(b, k))) < 1e-6 and np.cos(getattr(a, k) - getattr(b, k)) > 0, f"{k} must come back round to the front"
-    assert (SPRING[0] == 0).all() and (SPRING[NF] == 0).all(), "springs must be at rest at the loop point"
     assert abs((b.fl - a.fl + np.pi) % (2 * np.pi) - np.pi) < 1e-6, "gait phase must return"
-    assert abs((b.travel - a.travel + STEP_M * STRIDES / 2) % (STEP_M * STRIDES) - STEP_M * STRIDES / 2) < 1e-6, "road must wrap"
-    assert (frame(0)[0] == frame(NF)[0]).all(), "loop must wrap cleanly"
+    lamp = STEP_M * STRIDES
+    assert abs((b.travel - a.travel + lamp / 2) % lamp - lamp / 2) < 1e-6, "travel must end equal to its start modulo the lamp spacing"
+    assert (frame(tl, 0)[0] == frame(tl, tl.nf)[0]).all(), "loop must wrap cleanly"
 
-if __name__ == "__main__":
-    check_loop()
-    frames = [render(f) for f in range(NF)]
-    sheet = Image.new("RGB", (frames[0].width * 2, frames[0].height * 2))  # one palette sampled from four frames
-    for i, k in enumerate((0, 14, 27, 44)):
+def render_gif(tl, out_path, check=True, palette_frames=None):
+    """Renders frames 0..tl.nf-1 of Timeline tl and saves them as a looping GIF (one 256-colour palette sampled from four frames, no dither).
+    Runs check_loop(tl) first unless check=False. Returns the Path."""
+    if check:
+        check_loop(tl)
+    frames = [render(tl, f) for f in range(tl.nf)]
+    sheet = Image.new("RGB", (frames[0].width * 2, frames[0].height * 2))
+    for i, k in enumerate(palette_frames or [int(tl.nf * x) for x in (0, .2, .4, .65)]):
         sheet.paste(frames[k], (i % 2 * frames[0].width, i // 2 * frames[0].height))
     pal = sheet.quantize(colors=256, method=Image.Quantize.MEDIANCUT)
     frames = [fr.quantize(palette=pal, dither=Image.Dither.NONE) for fr in frames]
-    out = Path(__file__).with_name("walk.gif")
+    out = Path(out_path)
     frames[0].save(out, save_all=True, append_images=frames[1:], duration=FRAME_MS, loop=0, optimize=True)
-    print(out, f"{out.stat().st_size / 1e6:.2f} MB", f"{NF} frames", f"{round(W)}x{round(H) + 22}")
+    return out
+
+if __name__ == "__main__":
+    out = render_gif(CLASSIC, Path(__file__).with_name("walk.gif"), palette_frames=(0, 14, 27, 55))
+    print(out, f"{out.stat().st_size / 1e6:.2f} MB", f"{CLASSIC.nf} frames", f"{round(W)}x{round(H) + 22}")

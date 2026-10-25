@@ -20,3 +20,10 @@ I'm also a passionate retro enthusiast. Outside of my day-to-day work, I’m cre
 
 - 📧 [rijulrpi@gmail.com](mailto:rijulrpi@gmail.com)
 - 💼 [LinkedIn](https://www.linkedin.com/in/amrevr)
+
+<details>
+<summary>alternate walks</summary>
+
+[twirl](assets/variants/walk_twirl.gif) · [wave & skip](assets/variants/walk_waveskip.gif) · [look-back](assets/variants/walk_lookback.gif)
+
+</details>
