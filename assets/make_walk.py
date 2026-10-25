@@ -194,6 +194,7 @@ class Pose:
     htilt: float = 0.0     # head tilt, radians, + = crown toward screen-right
     wave: float = 0.0      # 0..1 right hand raised from the bow, waving at phase wph
     wph: float = 0.0
+    peek: bool = False     # back view only: draw the head from the front/profile (set while the head yaw is turned well past the shoulders)
     bob: float = 0.0       # breathing, fractions of H
     fan: float = 0.0       # spin speed 0..1: the hair and hem fan out
     whip: float = 0.0      # hair tip angle off the spine, radians, + = streaming toward screen-left
@@ -565,6 +566,56 @@ def girl(X, Y, pz, L, P, hair_aux):
         paint(ellipse(X, Y, bowx, bowy, 0.018 * H, 0.020 * H) < 1, 0.95, BOW, gap=True)
 
 
+    def head_front(with_neck=True):
+        """Head from the front or in profile (neck, face, bangs); front_upper uses it, and so does the back view when pz.peek and she looks over her shoulder."""
+        # ---- neck and head (head-local coordinates u, v in H, v = 0 at the head centre; the crown is at v = -0.07) ----
+        hcx, hcy = hdx, top + 0.07 * H
+        tc, ts = np.cos(pz.htilt), np.sin(pz.htilt)
+        U, V = ((X - hcx) * tc + (Y - hcy) * ts) / H, (-(X - hcx) * ts + (Y - hcy) * tc) / H
+        cd_, sd_ = np.cos(psi_d), np.sin(psi_d)
+        neck = (np.abs(X - (hcx * 0.4 + bx * 0.6)) < 0.017 * H) & (Y > hcy) & (Y < yy(0.19))
+        if with_neck: paint(neck, 0.7, SKIN)
+        rxv = 0.052 * (1 - 0.22 * np.clip(V / 0.067, 0, 1) ** 2)
+        head = (U / rxv) ** 2 + (V / 0.067) ** 2 < 1
+        face_side = np.where(sd_ >= 0, U < 0.052 * cd_, U > -0.052 * cd_)  # the hairline slides across the head as it turns away
+        cap = head & ~face_side
+        paint(cap, 0.45 + 0.25 * (0.5 + 0.5 * np.sin(U * 300)), HAIR)
+        skin = head & face_side
+        paint(skin, 0.92 - 0.25 * np.clip((V + 0.01) / 0.07, 0, 1) ** 2 - 0.12 * (U / 0.052) ** 2 - 0.06 * U / 0.052, SKIN)
+        # faceless: no eyes, nose or mouth, only a light blush on each cheek; it foreshortens and slides with the turn (profile: a plain silhouette)
+        w = max(cd_, 0.25)
+        fx = lambda u0: u0 * cd_ - 0.05 * sd_
+        for sg in (-1, 1):
+            paint((ellipse(U, V, fx(sg * 0.036), 0.036, 0.020 * w, 0.0115) < 1) & skin, 0.95, BLUSH)
+        # bangs across the forehead, parted at the centre, with a sheen ring; strands slant outward and down
+        ub = (U + 0.05 * sd_) / max(cd_, 0.35)
+        vt = V + 0.07
+        vb = 0.049 + 0.021 * (np.abs(ub) / 0.052) ** 1.5 + 0.0035 * np.sin(ub * 350)
+        bangs = (((U / (rxv + 0.004)) ** 2 + (V / 0.071) ** 2) < 1) & (vt < vb) & (face_side | (np.abs(U) < 0.004))
+        sf = (ub + 0.25 * np.sign(ub) * vt) * 62
+        ring_b = np.exp(-(((vt - 0.024 - 0.012 * (ub / 0.05) ** 2)) / 0.011) ** 2)
+        lum_b = (0.3 + 0.3 * (0.5 + 0.5 * np.sin(sf)) + 0.12 * (0.5 + 0.5 * np.sin(ub * 190 + 3 * vt))) * (0.8 + 0.2 * (1 - (ub / 0.06) ** 2)) + 0.4 * ring_b
+        paint(bangs, lum_b, np.where(ring_b > 0.35, HAIR_S, HAIR))
+        gy, gx = np.gradient(sf)
+        phi2 = 2 * np.arctan2(-gy, gx)
+        hair_aux[0][bangs], hair_aux[1][bangs], hair_aux[2][bangs] = np.cos(phi2)[bangs], np.sin(phi2)[bangs], np.clip(ring_b, 0, 1)[bangs]
+
+    def locks(sides=(-1, 1)):
+        hcx, cd_, sd_ = hdx, np.cos(psi_d), np.sin(psi_d)
+        # ---- side locks framing the face, down past the shoulders; they swing with the hair springs ----
+        vl = (Y - top) / H
+        for side in sides:
+            xc = hcx + H * (side * 0.057 * cd_ - 0.05 * sd_ + 0.008 * np.sin(vl * 26 + side)) - pz.whip * 0.07 * H * smooth((vl - 0.08) / 0.25) ** 1.3 \
+                + 0.07 * H * np.sin(pz.htilt) * smooth((vl - 0.1) / 0.2)
+            wl = H * (0.0105 + 0.002 * np.sin(vl * 50)) * (0.6 + 0.4 * max(cd_, 0.3)) * smooth((vl - 0.04) / 0.04) * (1 - 0.7 * smooth((vl - 0.22) / 0.11) ** 1.5)
+            lock = (np.abs(X - xc) < wl) & (vl > 0.04) & (vl < 0.325 + 0.01 * side)
+            ul = (X - xc) / np.maximum(wl, 1)
+            lum_l = (0.3 + 0.35 * (0.5 + 0.5 * np.sin(ul * 6 + vl * 30))) * (0.75 + 0.25 * (1 - ul ** 2)) + 0.3 * np.exp(-((vl - 0.12) / 0.03) ** 2)
+            paint(lock, lum_l, np.where(lum_l > 0.62, HAIR_S, HAIR))
+            gy, gx = np.gradient(ul * 4 + vl * 70 * 0.2)
+            phi2 = 2 * np.arctan2(-gy, gx)
+            hair_aux[0][lock], hair_aux[1][lock], hair_aux[2][lock] = np.cos(phi2)[lock], np.sin(phi2)[lock], (lum_l > 0.62)[lock] * 0.0
+
     def front_upper():
         """Facing us: blouse with the sailor V and the lilac neckerchief, neck, head with the face, bangs, arms, puff sleeves, side locks."""
         c_s, s_s = np.cos(psi_s), np.sin(psi_s)
@@ -598,37 +649,7 @@ def girl(X, Y, pz, L, P, hair_aux):
             paint(d < 1, np.where(hole, 0.5, 0.6 + 0.4 * np.clip(d, 0, 1)), np.where(hole | (d > 0.6), BOW_S, BOW), gap=True)
         paint(ellipse(X, Y, nx, ny, 0.0145 * H, 0.0155 * H) < 1, 0.95, BOW, gap=True)
 
-        # ---- neck and head (head-local coordinates u, v in H, v = 0 at the head centre; the crown is at v = -0.07) ----
-        hcx, hcy = hdx, top + 0.07 * H
-        tc, ts = np.cos(pz.htilt), np.sin(pz.htilt)
-        U, V = ((X - hcx) * tc + (Y - hcy) * ts) / H, (-(X - hcx) * ts + (Y - hcy) * tc) / H
-        cd_, sd_ = np.cos(psi_d), np.sin(psi_d)
-        neck = (np.abs(X - (hcx * 0.4 + bx * 0.6)) < 0.017 * H) & (Y > hcy) & (Y < yy(0.19))
-        paint(neck, 0.7, SKIN)
-        rxv = 0.052 * (1 - 0.22 * np.clip(V / 0.067, 0, 1) ** 2)
-        head = (U / rxv) ** 2 + (V / 0.067) ** 2 < 1
-        face_side = np.where(sd_ >= 0, U < 0.052 * cd_, U > -0.052 * cd_)  # the hairline slides across the head as it turns away
-        cap = head & ~face_side
-        paint(cap, 0.45 + 0.25 * (0.5 + 0.5 * np.sin(U * 300)), HAIR)
-        skin = head & face_side
-        paint(skin, 0.92 - 0.25 * np.clip((V + 0.01) / 0.07, 0, 1) ** 2 - 0.12 * (U / 0.052) ** 2 - 0.06 * U / 0.052, SKIN)
-        # faceless: no eyes, nose or mouth, only a light blush on each cheek; it foreshortens and slides with the turn (profile: a plain silhouette)
-        w = max(cd_, 0.25)
-        fx = lambda u0: u0 * cd_ - 0.05 * sd_
-        for sg in (-1, 1):
-            paint((ellipse(U, V, fx(sg * 0.036), 0.036, 0.020 * w, 0.0115) < 1) & skin, 0.95, BLUSH)
-        # bangs across the forehead, parted at the centre, with a sheen ring; strands slant outward and down
-        ub = (U + 0.05 * sd_) / max(cd_, 0.35)
-        vt = V + 0.07
-        vb = 0.049 + 0.021 * (np.abs(ub) / 0.052) ** 1.5 + 0.0035 * np.sin(ub * 350)
-        bangs = (((U / (rxv + 0.004)) ** 2 + (V / 0.071) ** 2) < 1) & (vt < vb) & (face_side | (np.abs(U) < 0.004))
-        sf = (ub + 0.25 * np.sign(ub) * vt) * 62
-        ring_b = np.exp(-(((vt - 0.024 - 0.012 * (ub / 0.05) ** 2)) / 0.011) ** 2)
-        lum_b = (0.3 + 0.3 * (0.5 + 0.5 * np.sin(sf)) + 0.12 * (0.5 + 0.5 * np.sin(ub * 190 + 3 * vt))) * (0.8 + 0.2 * (1 - (ub / 0.06) ** 2)) + 0.4 * ring_b
-        paint(bangs, lum_b, np.where(ring_b > 0.35, HAIR_S, HAIR))
-        gy, gx = np.gradient(sf)
-        phi2 = 2 * np.arctan2(-gy, gx)
-        hair_aux[0][bangs], hair_aux[1][bangs], hair_aux[2][bangs] = np.cos(phi2)[bangs], np.sin(phi2)[bangs], np.clip(ring_b, 0, 1)[bangs]
+        head_front()
 
         # ---- arms: two-bone reach from the shoulder to the hand; the hands rest at the bow, tuck in, fling out in the spin, or one waves ----
         LU, LF = 0.17 * H, 0.15 * H
@@ -672,19 +693,7 @@ def girl(X, Y, pz, L, P, hair_aux):
             slv = (d < 1) & (Y < bot)
             paint(slv, 0.9 - 0.25 * np.clip(d, 0, 1) ** 2 - 0.18 * np.clip((Y - sy) / (0.04 * H), 0, 1), BLOUSE, gap=True)
             paint(slv & (((Y > bot - 0.024 * H) & (Y < bot - 0.016 * H)) | ((Y > bot - 0.011 * H) & (Y < bot - 0.003 * H))), 0.7, TRIM)
-        # ---- side locks framing the face, down past the shoulders; they swing with the hair springs ----
-        vl = (Y - top) / H
-        for side in (-1, 1):
-            xc = hcx + H * (side * 0.057 * cd_ - 0.05 * sd_ + 0.008 * np.sin(vl * 26 + side)) - pz.whip * 0.07 * H * smooth((vl - 0.08) / 0.25) ** 1.3 \
-                + 0.07 * H * np.sin(pz.htilt) * smooth((vl - 0.1) / 0.2)
-            wl = H * (0.0105 + 0.002 * np.sin(vl * 50)) * (0.6 + 0.4 * max(cd_, 0.3)) * smooth((vl - 0.04) / 0.04) * (1 - 0.7 * smooth((vl - 0.22) / 0.11) ** 1.5)
-            lock = (np.abs(X - xc) < wl) & (vl > 0.04) & (vl < 0.325 + 0.01 * side)
-            ul = (X - xc) / np.maximum(wl, 1)
-            lum_l = (0.3 + 0.35 * (0.5 + 0.5 * np.sin(ul * 6 + vl * 30))) * (0.75 + 0.25 * (1 - ul ** 2)) + 0.3 * np.exp(-((vl - 0.12) / 0.03) ** 2)
-            paint(lock, lum_l, np.where(lum_l > 0.62, HAIR_S, HAIR))
-            gy, gx = np.gradient(ul * 4 + vl * 70 * 0.2)
-            phi2 = 2 * np.arctan2(-gy, gx)
-            hair_aux[0][lock], hair_aux[1][lock], hair_aux[2][lock] = np.cos(phi2)[lock], np.sin(phi2)[lock], (lum_l > 0.62)[lock] * 0.0
+        locks()
 
     if front:  # hair, ribbons and bow sit behind her
         hair(); ribbons(); bow()
@@ -740,7 +749,10 @@ def girl(X, Y, pz, L, P, hair_aux):
     if front:
         front_upper()
     else:
-        back_upper(); hair(); ribbons(); bow()
+        back_upper(); hair(); ribbons()
+        if pz.peek:  # looking over her shoulder: the head in profile over the back-drawn torso (the bow stays on the back of her head)
+            head_front(False); locks((-1,))  # one lock frames the face; the other would cover the cheek
+        bow()
 
 def shade_rgb(P, L, T, X, Y):
     """Part base colour x luminance, with a slow tonal drift inside each part and cool shadows / warm lights.
