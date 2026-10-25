@@ -7,7 +7,7 @@ CS grad student at RPI, working on the agents/evals/data side of AI. I make cont
     <source media="(prefers-reduced-motion: reduce)" srcset="assets/walk_still.png">
     <img src="assets/walk_cycle.gif" alt="ASCII girl with long hair and a bow walking away down a night road, to Cry by Aisin-Gioro and Toyoki" width="865">
   </picture><br>
-  <a href="https://example.com/">Want to make something like this ✧｡٩(ˊᗜˋ )و✧*｡</a>
+  <a href="https://github.com/amrevr/asciify">Want to make something like this ✧｡٩(ˊᗜˋ )و✧*｡</a>
 </p>
 
 I've spent the last few summers building and evaluating LLM agents. Currently, I'm consulting for designing an observability and governance layer for agentic systems at a fintech bank.
